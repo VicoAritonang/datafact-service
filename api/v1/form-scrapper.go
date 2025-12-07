@@ -22,13 +22,11 @@ type QuestionItem struct {
 	Options []string `json:"options,omitempty"`
 }
 
-// FormSaveState adalah objek "saves" yang akan Anda simpan di DB
-// Ini berisi "Kunci Jawaban" (Mapping ID) agar injector tidak bingung
 type FormSaveState struct {
 	FormID      string  `json:"form_id"`
 	Fbzx        string  `json:"fbzx"`
 	PageHistory string  `json:"page_history"`
-	EntryIDs    []int64 `json:"entry_ids"` // Urutan ID pertanyaan
+	EntryIDs    []int64 `json:"entry_ids"`
 }
 
 type ScrapeResponse struct {
@@ -41,9 +39,9 @@ type ScrapeResponse struct {
 
 func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
-	// Penting: User Agent agar tidak diblokir
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+	// Menggunakan fastClient dari utils.go
 	resp, err := fastClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -62,7 +60,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	jsonStr := match[1]
 	
-	// Unmarshal ke interface{} (karena struktur google form sangat nested/berantakan)
 	var rawData []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &rawData); err != nil {
 		return nil, fmt.Errorf("gagal parsing JSON form structure")
@@ -70,13 +67,11 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	// 2. Cari Token FBZX
 	var fbzx string
-	// Coba cari di HTML input hidden dulu
 	reFbzx := regexp.MustCompile(`name="fbzx" value="(.*?)"`)
 	fbzxMatch := reFbzx.FindStringSubmatch(content)
 	if len(fbzxMatch) > 1 {
 		fbzx = fbzxMatch[1]
 	} else {
-		// Fallback: ambil dari array JSON (biasanya index 14)
 		if len(rawData) > 14 {
 			if val, ok := rawData[14].(string); ok {
 				fbzx = val
@@ -84,7 +79,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		}
 	}
 
-	// 3. Parsing Pertanyaan (Struktur ada di index [1][1])
+	// 3. Parsing Pertanyaan
 	if len(rawData) < 2 { return nil, fmt.Errorf("struktur JSON invalid") }
 	
 	lvl1, ok := rawData[1].([]interface{})
@@ -100,13 +95,11 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		qArray, ok := item.([]interface{})
 		if !ok || len(qArray) < 5 { continue }
 
-		// Cek apakah ini pertanyaan valid (index 4 berisi detail input)
 		inputDetails, ok := qArray[4].([]interface{})
 		if !ok || len(inputDetails) == 0 {
-			continue // Skip section header / deskripsi
+			continue 
 		}
 
-		// Ambil Entry ID (biasanya di inputDetails[0][0])
 		detailInner, ok := inputDetails[0].([]interface{})
 		if !ok || len(detailInner) == 0 { continue }
 		
@@ -114,10 +107,8 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		if !ok { continue }
 		entryID := int64(idFloat)
 
-		// Ambil Teks
 		qText, _ := qArray[1].(string)
 
-		// Ambil Opsi (Pilihan Ganda) jika ada
 		var options []string
 		if len(detailInner) > 1 {
 			if optsRaw, ok := detailInner[1].([]interface{}); ok {
@@ -139,7 +130,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		entryIDs = append(entryIDs, entryID)
 	}
 
-	// Ambil Judul Form
 	desc, _ := lvl1[0].(string)
 
 	return &ScrapeResponse{
@@ -156,6 +146,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 // Handler Entry Point
 func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
+	// Menggunakan mustAuthorize dari utils.go
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
@@ -166,7 +157,6 @@ func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Baca body untuk ambil form_url
 	var req ScrapeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
