@@ -14,10 +14,11 @@ import (
 
 // --- Models Injector ---
 
+// Kita gunakan json.RawMessage untuk menangani input yang dinamis (bisa string, bisa object)
 type InjectRequest struct {
 	FormURL string          `json:"form_url"`
-	Saves   FormSaveState   `json:"saves"` 
-	Answers [][]interface{} `json:"answers"` 
+	Saves   json.RawMessage `json:"saves"`   // Raw: bisa string JSON atau objek JSON
+	Answers json.RawMessage `json:"answers"` // Raw: bisa string JSON atau array JSON
 }
 
 type InjectResult struct {
@@ -25,6 +26,22 @@ type InjectResult struct {
 	Success int      `json:"success"`
 	Failed  int      `json:"failed"`
 	Details []string `json:"details"`
+}
+
+// --- Helper Functions ---
+
+// helper untuk menangani "Double JSON Encoding" dari n8n
+// n8n sering mengirim field sebagai string: "saves": "{\"id\":1}"
+// fungsi ini akan membukanya menjadi struct asli
+func parseFlexibleJSON(raw json.RawMessage, target interface{}) error {
+	// 1. Coba unmarshal sebagai string dulu (kasus n8n)
+	var jsonString string
+	if err := json.Unmarshal(raw, &jsonString); err == nil {
+		// Jika berhasil jadi string, unmarshal isi stringnya ke target
+		return json.Unmarshal([]byte(jsonString), target)
+	}
+	// 2. Jika bukan string, berarti sudah object, unmarshal langsung
+	return json.Unmarshal(raw, target)
 }
 
 // --- Handler ---
@@ -41,24 +58,74 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Decode Level 1 (Wrapper)
 	var req InjectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json body", http.StatusBadRequest)
+		http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if len(req.Answers) == 0 {
-		http.Error(w, "no answers provided", http.StatusBadRequest)
-		return
+	// 2. Parsing Flexible 'Saves' (String atau Object)
+	var savesData FormSaveState
+	if len(req.Saves) > 0 {
+		if err := parseFlexibleJSON(req.Saves, &savesData); err != nil {
+			http.Error(w, "invalid saves format: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
-	if len(req.Saves.EntryIDs) == 0 {
+	// 3. Parsing Flexible 'Answers' (String atau Array)
+	var rawAnswers []interface{}
+	if len(req.Answers) > 0 {
+		if err := parseFlexibleJSON(req.Answers, &rawAnswers); err != nil {
+			http.Error(w, "invalid answers format: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// 4. Normalisasi Jawaban (Map ke Slice)
+	// Input n8n berbentuk [{"Nama":"Budi", "Usia":20}] -> Map
+	// Kita butuh [["Budi", 20]] -> Slice
+	var finalAnswers [][]interface{}
+
+	for _, item := range rawAnswers {
+		switch v := item.(type) {
+		case []interface{}:
+			// Sudah format list (Aman)
+			finalAnswers = append(finalAnswers, v)
+		case map[string]interface{}:
+			// Format Object (Bahaya: Order map di Go acak)
+			// Kita coba ekstrak values-nya saja. 
+			// NOTE: Idealnya n8n mengirim array of array, bukan array of object.
+			// Kode ini akan mencoba mengambil value, tapi urutannya mungkin tidak sesuai form
+			// karena map[string] tidak punya urutan pasti.
+			var row []interface{}
+			// PENTING: Karena map tidak berurut, kita pakai entryIDs dari Saves sebagai acuan jumlah
+			// Tapi kita tidak punya key mapping (misal ID 123 = "Nama"). 
+			// Jadi kita terpaksa mengambil semua value dari map.
+			for _, val := range v {
+				row = append(row, val)
+			}
+			finalAnswers = append(finalAnswers, row)
+		default:
+			// Format tidak dikenal
+			continue
+		}
+	}
+
+	// Validasi Data
+	if len(finalAnswers) == 0 {
+		http.Error(w, "no answers provided/parsed", http.StatusBadRequest)
+		return
+	}
+	if len(savesData.EntryIDs) == 0 {
 		http.Error(w, "invalid saves data: entry_ids missing", http.StatusBadRequest)
 		return
 	}
 
+	// 5. Proses Concurrent Injection
 	var wg sync.WaitGroup
-	total := len(req.Answers)
+	total := len(finalAnswers)
 	resultChan := make(chan string, total)
 	
 	successCount := 0
@@ -68,7 +135,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 	maxConcurrency := 20
 	semaphore := make(chan struct{}, maxConcurrency)
 
-	for i, ansRow := range req.Answers {
+	for i, ansRow := range finalAnswers {
 		wg.Add(1)
 		
 		go func(idx int, answerSet []interface{}) {
@@ -79,10 +146,11 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 			var responses []interface{}
 
+			// Mapping jawaban ke Entry ID
 			for j, val := range answerSet {
-				if j >= len(req.Saves.EntryIDs) { break }
+				if j >= len(savesData.EntryIDs) { break }
 				
-				entryID := req.Saves.EntryIDs[j]
+				entryID := savesData.EntryIDs[j]
 				valStr := fmt.Sprintf("%v", val)
 				
 				entryData := []interface{}{
@@ -97,7 +165,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 			fullStructure := []interface{}{
 				responses,
 				nil,
-				req.Saves.Fbzx,
+				savesData.Fbzx,
 			}
 			
 			partialJSON, _ := json.Marshal(fullStructure)
@@ -105,8 +173,8 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 			data := url.Values{}
 			data.Set("fvv", "1")
 			data.Set("partialResponse", string(partialJSON))
-			data.Set("pageHistory", req.Saves.PageHistory)
-			data.Set("fbzx", req.Saves.Fbzx)
+			data.Set("pageHistory", savesData.PageHistory)
+			data.Set("fbzx", savesData.Fbzx)
 			data.Set("submissionTimestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 
 			// Menggunakan fastClient dari utils.go
