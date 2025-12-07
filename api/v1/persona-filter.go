@@ -174,4 +174,159 @@ func buildPostgrestQuery(filter map[string]interface{}, fb FilterBody, table str
 			// 3) string kolom langsung → eq/in
 			if _, isStr := stringCols[field]; isStr {
 				// toStringSlice dari utils.go
-				vals, err := toStringSlice(
+				vals, err := toStringSlice(value)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				stringIn[field] = append(stringIn[field], vals...)
+				mu.Unlock()
+				return
+			}
+
+			// 4) numerik kolom langsung → eq / in (opsional)
+			if _, isNum := numericCols[field]; isNum {
+				if vals, err := toStringSlice(value); err == nil {
+					mu.Lock()
+					stringIn[field] = append(stringIn[field], vals...)
+					mu.Unlock()
+					return
+				}
+				if n, err := toInt64(value); err == nil {
+					mu.Lock()
+					q.Add(field, fmt.Sprintf("eq.%d", n))
+					mu.Unlock()
+					return
+				}
+				return
+			}
+
+			// 5) field tak dikenal → ABAIKAN
+			return
+		}(k, v)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// render hasil gabungan
+	for col, b := range numBounds {
+		if b.min != nil {
+			q.Add(col, fmt.Sprintf("gte.%d", *b.min))
+		}
+		if b.max != nil {
+			q.Add(col, fmt.Sprintf("lte.%d", *b.max))
+		}
+	}
+	for col, vals := range stringIn {
+		if len(vals) == 0 {
+			continue
+		}
+		items := make([]string, 0, len(vals))
+		for _, v := range vals {
+			safe := strings.ReplaceAll(v, `"`, `\"`)
+			items = append(items, fmt.Sprintf(`"%s"`, safe))
+		}
+		q.Add(col, fmt.Sprintf("in.(%s)", strings.Join(items, ",")))
+	}
+	for col, b := range boolEq {
+		if b {
+			q.Add(col, "eq.true")
+		} else {
+			q.Add(col, "eq.false")
+		}
+	}
+
+	if fb.Limit != nil {
+		q.Set("limit", strconv.Itoa(*fb.Limit))
+	}
+	if fb.Offset != nil {
+		q.Set("offset", strconv.Itoa(*fb.Offset))
+	}
+
+	return q.Encode(), nil
+}
+
+// =====================
+// Handler Entrypoint
+// =====================
+
+func Handler(w http.ResponseWriter, r *http.Request) {
+	// mustAuthorize dari utils.go
+	if err := mustAuthorize(r); err != nil {
+		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "use GET", http.StatusMethodNotAllowed)
+		return
+	}
+
+	conf := loadSupabaseConfig()
+
+	// Baca body
+	var fb FilterBody
+	if r.Body != nil {
+		defer r.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &fb); err != nil {
+				http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	// Normalisasi filter
+	filterMap, err := normalizeFilter(fb.Filter)
+	if err != nil {
+		http.Error(w, "invalid filter: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Build QS
+	qs, err := buildPostgrestQuery(filterMap, fb, conf.Table)
+	if err != nil {
+		http.Error(w, "invalid filter: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	endpoint := fmt.Sprintf("%s/rest/v1/%s?%s",
+		strings.TrimRight(conf.BaseURL, "/"),
+		url.PathEscape(conf.Table),
+		qs,
+	)
+
+	req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
+	req.Header.Set("apikey", conf.APIKey)
+	req.Header.Set("Authorization", "Bearer "+conf.APIKey)
+	req.Header.Set("Accept-Encoding", "gzip")
+	if conf.Schema != "" && conf.Schema != "public" {
+		req.Header.Set("Accept-Profile", conf.Schema)
+	}
+
+	// fastClient dari utils.go
+	resp, err := fastClient.Do(req)
+	if err != nil {
+		http.Error(w, "supabase request error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+
+	var reader io.Reader = resp.Body
+	if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+		if gz, gzErr := gzip.NewReader(resp.Body); gzErr == nil {
+			defer gz.Close()
+			reader = gz
+		}
+	}
+	io.Copy(w, reader)
+}
