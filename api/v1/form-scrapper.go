@@ -152,8 +152,10 @@ func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method != http.MethodGet {
-		http.Error(w, "use GET", http.StatusMethodNotAllowed)
+	// UBAH DISINI: Ganti GET menjadi POST
+	// Google Cloud Run memblokir GET request yang memiliki Body JSON
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
 

@@ -262,8 +262,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "use GET", http.StatusMethodNotAllowed)
+
+	// [FIX] Ubah validasi dari GET ke POST
+	// Karena request ini membawa JSON Body, Cloud Run mewajibkan method POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -302,6 +305,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		qs,
 	)
 
+	// [NOTE] Request ke Supabase TETAP menggunakan GET
+	// Karena kita mengubah JSON Body menjadi Query Params URL
 	req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
 	req.Header.Set("apikey", conf.APIKey)
 	req.Header.Set("Authorization", "Bearer "+conf.APIKey)
