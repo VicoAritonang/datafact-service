@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort" // Tambahan import untuk sorting
 	"strconv"
 	"strings"
 	"sync"
@@ -31,23 +32,17 @@ type InjectResult struct {
 // --- Helper Functions ---
 
 // helper untuk menangani "Double JSON Encoding" dari n8n
-// n8n sering mengirim field sebagai string: "saves": "{\"id\":1}"
-// fungsi ini akan membukanya menjadi struct asli
 func parseFlexibleJSON(raw json.RawMessage, target interface{}) error {
-	// 1. Coba unmarshal sebagai string dulu (kasus n8n)
 	var jsonString string
 	if err := json.Unmarshal(raw, &jsonString); err == nil {
-		// Jika berhasil jadi string, unmarshal isi stringnya ke target
 		return json.Unmarshal([]byte(jsonString), target)
 	}
-	// 2. Jika bukan string, berarti sudah object, unmarshal langsung
 	return json.Unmarshal(raw, target)
 }
 
 // --- Handler ---
 
 func InjectorHandler(w http.ResponseWriter, r *http.Request) {
-	// Menggunakan mustAuthorize dari utils.go
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
@@ -65,7 +60,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Parsing Flexible 'Saves' (String atau Object)
+	// 2. Parsing Flexible 'Saves'
 	var savesData FormSaveState
 	if len(req.Saves) > 0 {
 		if err := parseFlexibleJSON(req.Saves, &savesData); err != nil {
@@ -74,7 +69,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. Parsing Flexible 'Answers' (String atau Array)
+	// 3. Parsing Flexible 'Answers'
 	var rawAnswers []interface{}
 	if len(req.Answers) > 0 {
 		if err := parseFlexibleJSON(req.Answers, &rawAnswers); err != nil {
@@ -83,32 +78,57 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Normalisasi Jawaban (Map ke Slice)
-	// Input n8n berbentuk [{"Nama":"Budi", "Usia":20}] -> Map
-	// Kita butuh [["Budi", 20]] -> Slice
+	// 4. Normalisasi Jawaban (FIXED: Deterministic Ordering)
 	var finalAnswers [][]interface{}
 
 	for _, item := range rawAnswers {
 		switch v := item.(type) {
 		case []interface{}:
-			// Sudah format list (Aman)
+			// Format Array: [ "Budi", 20 ] -> Urutan sesuai index (Aman)
 			finalAnswers = append(finalAnswers, v)
+
 		case map[string]interface{}:
-			// Format Object (Bahaya: Order map di Go acak)
-			// Kita coba ekstrak values-nya saja. 
-			// NOTE: Idealnya n8n mengirim array of array, bukan array of object.
-			// Kode ini akan mencoba mengambil value, tapi urutannya mungkin tidak sesuai form
-			// karena map[string] tidak punya urutan pasti.
-			var row []interface{}
-			// PENTING: Karena map tidak berurut, kita pakai entryIDs dari Saves sebagai acuan jumlah
-			// Tapi kita tidak punya key mapping (misal ID 123 = "Nama"). 
-			// Jadi kita terpaksa mengambil semua value dari map.
-			for _, val := range v {
-				row = append(row, val)
+			// Format Object: { "Nama": "Budi", "Usia": 20 }
+			// PERBAIKAN: Menghindari random iteration map di Go.
+
+			// Langkah A: Cek apakah key-nya adalah Entry ID?
+			// Ini fitur advanced: user bisa kirim {"12345": "Jawaban"} agar pasti tepat sasaran
+			rowByID := make([]interface{}, len(savesData.EntryIDs))
+			matchByID := false
+
+			for idx, id := range savesData.EntryIDs {
+				idStr := strconv.FormatInt(id, 10)
+				// Cek apakah ada key yang sama dengan ID Entry
+				if val, ok := v[idStr]; ok {
+					rowByID[idx] = val
+					matchByID = true
+				} else {
+					// Jika pakai mode ID tapi data kosong, isi nil
+					rowByID[idx] = nil 
+				}
 			}
-			finalAnswers = append(finalAnswers, row)
+
+			if matchByID {
+				// Jika ditemukan setidaknya satu key yang cocok dengan ID, gunakan mode ini
+				finalAnswers = append(finalAnswers, rowByID)
+			} else {
+				// Langkah B: Jika key bukan ID (misal "Nama", "Email")
+				// Kita HARUS mengurutkan key secara alfabetis agar stabil (Deterministik)
+				// User disarankan memberi prefix di n8n: "1_Nama", "2_Email" agar urut
+				var keys []string
+				for k := range v {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys) // SORTING DILAKUKAN DISINI
+
+				var row []interface{}
+				for _, k := range keys {
+					row = append(row, v[k])
+				}
+				finalAnswers = append(finalAnswers, row)
+			}
+
 		default:
-			// Format tidak dikenal
 			continue
 		}
 	}
@@ -123,11 +143,11 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Proses Concurrent Injection
+	// 5. Proses Concurrent Injection (TIDAK BERUBAH)
 	var wg sync.WaitGroup
 	total := len(finalAnswers)
 	resultChan := make(chan string, total)
-	
+
 	successCount := 0
 	failCount := 0
 	var mu sync.Mutex
@@ -137,10 +157,10 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 	for i, ansRow := range finalAnswers {
 		wg.Add(1)
-		
+
 		go func(idx int, answerSet []interface{}) {
 			defer wg.Done()
-			
+
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
@@ -148,15 +168,22 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 			// Mapping jawaban ke Entry ID
 			for j, val := range answerSet {
-				if j >= len(savesData.EntryIDs) { break }
+				if j >= len(savesData.EntryIDs) {
+					break
+				}
 				
+				// Skip jika jawaban nil (untuk partial update via map ID)
+				if val == nil {
+					continue
+				}
+
 				entryID := savesData.EntryIDs[j]
 				valStr := fmt.Sprintf("%v", val)
-				
+
 				entryData := []interface{}{
-					nil, 
-					entryID, 
-					[]string{valStr}, 
+					nil,
+					entryID,
+					[]string{valStr},
 					0,
 				}
 				responses = append(responses, entryData)
@@ -167,7 +194,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 				nil,
 				savesData.Fbzx,
 			}
-			
+
 			partialJSON, _ := json.Marshal(fullStructure)
 
 			data := url.Values{}
@@ -177,14 +204,13 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 			data.Set("fbzx", savesData.Fbzx)
 			data.Set("submissionTimestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 
-			// Menggunakan fastClient dari utils.go
 			postReq, _ := http.NewRequest("POST", req.FormURL, strings.NewReader(data.Encode()))
 			postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			postReq.Header.Set("User-Agent", "Mozilla/5.0 (DataFact Injector Bot)")
 			postReq.Header.Set("Origin", "https://docs.google.com")
-			
+
 			resp, err := fastClient.Do(postReq)
-			
+
 			mu.Lock()
 			if err == nil && resp.StatusCode == 200 {
 				successCount++
@@ -199,7 +225,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 				resultChan <- fmt.Sprintf("Row %d failed: %s", idx, errMsg)
 			}
 			mu.Unlock()
-			
+
 			if resp != nil {
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
