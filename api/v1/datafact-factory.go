@@ -65,7 +65,7 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-// --- Handler ---
+// ---  trigger ---
 
 func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 	// 1. Authorize (Cek DATAFACT_API_KEY)
