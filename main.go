@@ -16,6 +16,7 @@ func main() {
 	http.HandleFunc("/api/v1/persona-filter", handler.Handler)       // Ini fungsi Handler di persona-filter.go
 	http.HandleFunc("/api/v1/form-scrapper", handler.ScrapperHandler) // Ini fungsi di form-scrapper.go
 	http.HandleFunc("/api/v1/form-injector", handler.InjectorHandler) // Ini fungsi di form-injector.go
+	http.HandleFunc("/api/v1/datafact-factory", handler.DataFactFactoryHandler) // Ini fungsi di form-injector.go
 
 	// Tentukan Port (Google Cloud Run mewajibkan ambil dari environment variable PORT)
 	port := os.Getenv("PORT")
