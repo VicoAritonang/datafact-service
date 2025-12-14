@@ -35,7 +35,7 @@ type FactoryResponse struct {
 	Errors         []string `json:"errors"`
 }
 
-// ... (Struct GeminiContent, GeminiPayload, GeminiResponse SAMA SEPERTI SEBELUMNYA) ...
+// Struct Gemini (Sama seperti sebelumnya)
 type GeminiContent struct {
 	Role  string `json:"role"`
 	Parts []struct {
@@ -61,11 +61,10 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-
 // --- Handler ---
 
 func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Authorize
+	// 1. Authorization
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
@@ -76,7 +75,6 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Decode Body
 	var req FactoryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
@@ -92,7 +90,7 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 		req.Model = "gemini-2.5-flash"
 	}
 
-	// 3. Init Google Sheets
+	// 2. Init Google Sheets Service
 	ctx := context.Background()
 	sheetsService, err := createSheetsServiceWithRefreshToken(ctx)
 	if err != nil {
@@ -101,32 +99,36 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Ambil Header Spreadsheet (FIX: Explicit Sheet1)
-	// Kita baca baris pertama Sheet1 untuk mendapatkan header
-	readRange := "Sheet1!A1:Z1"
+	// 3. READ HEADER (Manual Map Automatically Logic)
+	// Kita baca baris pertama untuk tahu urutan kolom
+	readRange := "Sheet1!A1:ZZ1" // Baca selebar mungkin di baris 1
 	resp, err := sheetsService.Spreadsheets.Values.Get(req.SpreadsheetID, readRange).Do()
 	if err != nil {
-		http.Error(w, "failed to read spreadsheet header: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to read header: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	if len(resp.Values) == 0 {
-		http.Error(w, "Sheet1 is empty, please set headers in row 1", http.StatusBadRequest)
+		http.Error(w, "Sheet1 header row is empty", http.StatusBadRequest)
 		return
 	}
 
-	// Mapping Header Name -> Index Column (FIX: Case Insensitive)
-	// Kita simpan header dalam lowercase agar pencocokan lebih robust
-	headerMap := make(map[string]int)
-	headers := resp.Values[0]
-	for i, col := range headers {
-		if colStr, ok := col.(string); ok {
-			cleanName := strings.ToLower(strings.TrimSpace(colStr))
-			headerMap[cleanName] = i
+	headers := resp.Values[0] // Interface slice: ["Nama", "Usia", "Kota"]
+	
+	// Simpan urutan header: map["nama"] = 0, map["usia"] = 1
+	headerIndexMap := make(map[string]int)
+	for i, h := range headers {
+		if s, ok := h.(string); ok {
+			// Lowercase & trim agar matching lebih gampang
+			cleanHeader := strings.ToLower(strings.TrimSpace(s))
+			headerIndexMap[cleanHeader] = i
 		}
 	}
+	
+	// Debug Log untuk memastikan Header terbaca
+	fmt.Printf("[DEBUG] Headers Found: %v\n", headerIndexMap)
 
-	// 5. Orchestration Loop
+	// 4. Orchestration Loop
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -135,7 +137,6 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 
 	resultDetails := []string{}
 	successCount := 0
-
 	totalTasks := len(req.SystemPromptFactory)
 
 	for i, personaPrompt := range req.SystemPromptFactory {
@@ -143,95 +144,105 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 
 		go func(idx int, persona string) {
 			defer wg.Done()
-
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// --- PHASE 1: GENERATE (Persona) ---
+			// --- A. Gemini Generate ---
 			taskUserPrompt := req.UserPromptFactory
 			if req.FormText != "" {
 				taskUserPrompt = strings.ReplaceAll(taskUserPrompt, "{{ $json.form }}", req.FormText)
 			}
-
 			genResult, err := callGemini(req.Model, req.GeminiAPIKey, persona, taskUserPrompt)
 			if err != nil {
 				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Gen Error: %v", idx, err))
+				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Gen Fail: %v", idx, err))
 				mu.Unlock()
 				return
 			}
 
-			// --- PHASE 2: PARSER ---
+			// --- B. Gemini Parser ---
 			parserUserPrompt := req.UserPromptParser
 			n8nPlaceholder := "{{ $json.choices[0].message.content }}"
-			
 			if strings.Contains(parserUserPrompt, n8nPlaceholder) {
 				parserUserPrompt = strings.ReplaceAll(parserUserPrompt, n8nPlaceholder, genResult)
 			} else {
 				parserUserPrompt = parserUserPrompt + "\n\nInput Text:\n" + genResult
 			}
-
+			
 			parsedRawStr, err := callGemini(req.Model, req.GeminiAPIKey, req.SystemPromptParser, parserUserPrompt)
 			if err != nil {
 				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Parse Error: %v", idx, err))
+				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Parse Fail: %v", idx, err))
 				mu.Unlock()
 				return
 			}
 
-			// --- PHASE 3: CLEAN & DECODE JSON ---
+			// --- C. JSON Parsing ---
 			cleanedJSON := cleanMarkdownJSON(parsedRawStr)
-			
 			var dataMap map[string]interface{}
 			if err := json.Unmarshal([]byte(cleanedJSON), &dataMap); err != nil {
 				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d JSON Error: %v | Raw: %s", idx, err, cleanedJSON))
+				resultDetails = append(resultDetails, fmt.Sprintf("Task %d JSON Fail: %v (Raw: %s)", idx, err, cleanedJSON))
 				mu.Unlock()
 				return
 			}
 
-			// --- PHASE 4: PREPARE ROW DATA (AUTO MAP) ---
-			
-			// Buat array kosong seukuran jumlah header
+			// --- D. MAPPING (The "Map Automatically" Logic) ---
+			// Siapkan array kosong seukuran jumlah header
 			rowValues := make([]interface{}, len(headers))
-			// Isi default string kosong
+			// Isi default string kosong agar tidak null
 			for k := range rowValues {
 				rowValues[k] = ""
 			}
 
-			// Smart Mapping: Loop data dari JSON, cari posisi kolomnya di HeaderMap
-			hasData := false
-			for key, val := range dataMap {
-				// Ubah key JSON ke lowercase & trim space agar cocok dengan header
-				keyClean := strings.ToLower(strings.TrimSpace(key))
+			mappedCount := 0
+			// Loop setiap key dari JSON hasil AI
+			for jsonKey, jsonVal := range dataMap {
+				// Bersihkan key dari JSON
+				cleanKey := strings.ToLower(strings.TrimSpace(jsonKey))
 				
-				if colIdx, found := headerMap[keyClean]; found {
-					rowValues[colIdx] = val
-					hasData = true
+				// Cek apakah key ini ada di header sheet kita?
+				if colIdx, exists := headerIndexMap[cleanKey]; exists {
+					rowValues[colIdx] = jsonVal
+					mappedCount++
+				} else {
+					// Opsional: Log jika ada key dari AI yang tidak ada kolomnya di Sheet
+					// fmt.Printf("[DEBUG] Key '%s' from AI not found in Sheet Headers\n", jsonKey)
 				}
 			}
 
-			// DEBUG LOG: Cek apakah rowValues terisi
-			if !hasData {
-				fmt.Printf("Warning Task %d: No matching headers found. JSON keys: %v\n", idx, dataMap)
+			// Jika tidak ada satupun data yang ter-mapping, kemungkinan besar format header beda
+			if mappedCount == 0 {
+				mu.Lock()
+				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Warning: No columns mapped! AI Keys: %v vs Headers: %v", idx, dataMap, headers))
+				mu.Unlock()
+				return // Skip write daripada nulis baris kosong
 			}
 
-			// --- PHASE 5: WRITE TO SHEET ---
-			// FIX: Gunakan "Sheet1!A1" agar append pasti masuk ke Sheet1
+			// --- E. WRITE TO SHEET ---
+			
+			// ValueRange object
 			vr := &sheets.ValueRange{
 				Values: [][]interface{}{rowValues},
 			}
-			
-			_, err = sheetsService.Spreadsheets.Values.Append(req.SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("USER_ENTERED").Do()
-			if err != nil {
-				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Sheet Write Error: %v", idx, err))
-				mu.Unlock()
-				return
-			}
 
-			mu.Lock()
-			successCount++
+			// APPEND REQUEST
+			// valueInputOption: USER_ENTERED (Penting agar angka masuk sebagai angka)
+			// insertDataOption: INSERT_ROWS (Penting agar sheet tidak cuma update row kosong tapi bikin row baru)
+			// range: "Sheet1" (Nama sheet saja, biarkan Google tentukan baris paling bawah)
+			
+			// Kita lock mutex karena write sheet sebaiknya serial untuk menghindari race condition di API
+			mu.Lock() 
+			_, err = sheetsService.Spreadsheets.Values.Append(req.SpreadsheetID, "Sheet1", vr).
+				ValueInputOption("USER_ENTERED").
+				InsertDataOption("INSERT_ROWS").
+				Do()
+				
+			if err != nil {
+				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Write Fail: %v", idx, err))
+			} else {
+				successCount++
+			}
 			mu.Unlock()
 
 		}(i, personaPrompt)
@@ -249,9 +260,9 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(respData)
 }
 
-// ... (Helper Functions createSheetsServiceWithRefreshToken, callGemini, cleanMarkdownJSON SAMA PERSIS) ...
-// Pastikan helper functions tetap ada di file ini atau di utils.go
-// Saya sertakan lagi di bawah agar copy-paste aman
+// ==========================================
+// HELPER FUNCTIONS (JANGAN LUPA DISERTAKAN)
+// ==========================================
 
 func createSheetsServiceWithRefreshToken(ctx context.Context) (*sheets.Service, error) {
 	refreshToken := os.Getenv("DATAFACT_GOOGLE_REFRESH_TOKEN")
@@ -279,8 +290,8 @@ func createSheetsServiceWithRefreshToken(ctx context.Context) (*sheets.Service, 
 }
 
 func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) {
-	// [Kode callGemini sama seperti sebelumnya, tidak ada perubahan logika]
-    // ... Implementasi sama ...
+	// (Kode callGemini sama seperti sebelumnya, copy paste dari jawaban sebelumnya)
+    // Pastikan pakai fastClient dari utils.go
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
 
 	payload := GeminiPayload{
