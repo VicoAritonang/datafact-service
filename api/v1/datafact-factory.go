@@ -23,14 +23,10 @@ type FactoryRequest struct {
 	UserPromptFactory   string   `json:"user_prompt_factory"`
 	UserPromptParser    string   `json:"user_prompt_parser"`
 	SystemPromptParser  string   `json:"system_prompt_parser"`
-
-	// N8n harus mengirim raw text form di field ini
-	// Nanti code akan me-replace {{ $json.form }} dengan isi ini
-	FormText string `json:"form_text"`
-
-	GeminiAPIKey  string `json:"gemini_api_key"`
-	SpreadsheetID string `json:"spreadsheet_id"`
-	Model         string `json:"model"`
+	FormText            string   `json:"form_text"`
+	GeminiAPIKey        string   `json:"gemini_api_key"`
+	SpreadsheetID       string   `json:"spreadsheet_id"`
+	Model               string   `json:"model"`
 }
 
 type FactoryResponse struct {
@@ -39,7 +35,7 @@ type FactoryResponse struct {
 	Errors         []string `json:"errors"`
 }
 
-// Struct untuk Payload ke Gemini REST API
+// ... (Struct GeminiContent, GeminiPayload, GeminiResponse SAMA SEPERTI SEBELUMNYA) ...
 type GeminiContent struct {
 	Role  string `json:"role"`
 	Parts []struct {
@@ -65,10 +61,11 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-// ---  trigger ---
+
+// --- Handler ---
 
 func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Authorize (Cek DATAFACT_API_KEY)
+	// 1. Authorize
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
@@ -86,7 +83,7 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validasi Input
+	// Validasi
 	if req.SpreadsheetID == "" || req.GeminiAPIKey == "" {
 		http.Error(w, "spreadsheet_id and gemini_api_key are required", http.StatusBadRequest)
 		return
@@ -95,18 +92,18 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 		req.Model = "gemini-2.5-flash"
 	}
 
-	// 3. Init Google Sheets Service dengan OAUTH2 (Refresh Token)
+	// 3. Init Google Sheets
 	ctx := context.Background()
 	sheetsService, err := createSheetsServiceWithRefreshToken(ctx)
 	if err != nil {
-		// Log error detail untuk debugging server side jika perlu
 		fmt.Printf("Sheets Auth Error: %v\n", err)
 		http.Error(w, "failed to init sheets service: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 4. Ambil Header Spreadsheet (Baris 1)
-	readRange := "A1:Z1"
+	// 4. Ambil Header Spreadsheet (FIX: Explicit Sheet1)
+	// Kita baca baris pertama Sheet1 untuk mendapatkan header
+	readRange := "Sheet1!A1:Z1"
 	resp, err := sheetsService.Spreadsheets.Values.Get(req.SpreadsheetID, readRange).Do()
 	if err != nil {
 		http.Error(w, "failed to read spreadsheet header: "+err.Error(), http.StatusInternalServerError)
@@ -114,17 +111,18 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(resp.Values) == 0 {
-		http.Error(w, "spreadsheet is empty, please set headers in row 1", http.StatusBadRequest)
+		http.Error(w, "Sheet1 is empty, please set headers in row 1", http.StatusBadRequest)
 		return
 	}
 
-	// Mapping Header Name -> Index Column
+	// Mapping Header Name -> Index Column (FIX: Case Insensitive)
+	// Kita simpan header dalam lowercase agar pencocokan lebih robust
 	headerMap := make(map[string]int)
 	headers := resp.Values[0]
 	for i, col := range headers {
 		if colStr, ok := col.(string); ok {
-			// Trim space biar aman dari typo spasi di sheet
-			headerMap[strings.TrimSpace(colStr)] = i
+			cleanName := strings.ToLower(strings.TrimSpace(colStr))
+			headerMap[cleanName] = i
 		}
 	}
 
@@ -132,7 +130,6 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Batasi concurrency (misal 5) agar tidak kena rate limit Gemini/Sheets
 	maxConcurrency := 5
 	sem := make(chan struct{}, maxConcurrency)
 
@@ -141,20 +138,16 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 
 	totalTasks := len(req.SystemPromptFactory)
 
-	// Loop setiap Persona
 	for i, personaPrompt := range req.SystemPromptFactory {
 		wg.Add(1)
 
 		go func(idx int, persona string) {
 			defer wg.Done()
 
-			// Acquire semaphore
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			// --- PHASE 1: GENERATE (Persona) ---
-			
-			// Replace variable {{ $json.form }} dengan FormText asli
 			taskUserPrompt := req.UserPromptFactory
 			if req.FormText != "" {
 				taskUserPrompt = strings.ReplaceAll(taskUserPrompt, "{{ $json.form }}", req.FormText)
@@ -169,15 +162,12 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// --- PHASE 2: PARSER ---
-			
-			// Replace variable {{ $json.choices... }} dengan hasil generate
 			parserUserPrompt := req.UserPromptParser
 			n8nPlaceholder := "{{ $json.choices[0].message.content }}"
 			
 			if strings.Contains(parserUserPrompt, n8nPlaceholder) {
 				parserUserPrompt = strings.ReplaceAll(parserUserPrompt, n8nPlaceholder, genResult)
 			} else {
-				// Fallback jika user lupa placeholder
 				parserUserPrompt = parserUserPrompt + "\n\nInput Text:\n" + genResult
 			}
 
@@ -190,7 +180,6 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// --- PHASE 3: CLEAN & DECODE JSON ---
-			
 			cleanedJSON := cleanMarkdownJSON(parsedRawStr)
 			
 			var dataMap map[string]interface{}
@@ -201,28 +190,39 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// --- PHASE 4: PREPARE ROW DATA ---
+			// --- PHASE 4: PREPARE ROW DATA (AUTO MAP) ---
 			
+			// Buat array kosong seukuran jumlah header
 			rowValues := make([]interface{}, len(headers))
+			// Isi default string kosong
 			for k := range rowValues {
 				rowValues[k] = ""
 			}
 
+			// Smart Mapping: Loop data dari JSON, cari posisi kolomnya di HeaderMap
+			hasData := false
 			for key, val := range dataMap {
-				keyClean := strings.TrimSpace(key)
+				// Ubah key JSON ke lowercase & trim space agar cocok dengan header
+				keyClean := strings.ToLower(strings.TrimSpace(key))
+				
 				if colIdx, found := headerMap[keyClean]; found {
 					rowValues[colIdx] = val
+					hasData = true
 				}
 			}
 
+			// DEBUG LOG: Cek apakah rowValues terisi
+			if !hasData {
+				fmt.Printf("Warning Task %d: No matching headers found. JSON keys: %v\n", idx, dataMap)
+			}
+
 			// --- PHASE 5: WRITE TO SHEET ---
-			
+			// FIX: Gunakan "Sheet1!A1" agar append pasti masuk ke Sheet1
 			vr := &sheets.ValueRange{
 				Values: [][]interface{}{rowValues},
 			}
-
-			// Append data ke sheet
-			_, err = sheetsService.Spreadsheets.Values.Append(req.SpreadsheetID, "A1", vr).ValueInputOption("USER_ENTERED").Do()
+			
+			_, err = sheetsService.Spreadsheets.Values.Append(req.SpreadsheetID, "Sheet1!A1", vr).ValueInputOption("USER_ENTERED").Do()
 			if err != nil {
 				mu.Lock()
 				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Sheet Write Error: %v", idx, err))
@@ -239,7 +239,6 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
-	// 6. Response
 	respData := FactoryResponse{
 		TotalProcessed: totalTasks,
 		SuccessCount:   successCount,
@@ -250,43 +249,38 @@ func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(respData)
 }
 
-// --- Helper: Google Sheets Auth (Refresh Token Flow) ---
+// ... (Helper Functions createSheetsServiceWithRefreshToken, callGemini, cleanMarkdownJSON SAMA PERSIS) ...
+// Pastikan helper functions tetap ada di file ini atau di utils.go
+// Saya sertakan lagi di bawah agar copy-paste aman
 
 func createSheetsServiceWithRefreshToken(ctx context.Context) (*sheets.Service, error) {
-	// Ambil credentials dari ENV
 	refreshToken := os.Getenv("DATAFACT_GOOGLE_REFRESH_TOKEN")
 	clientID := os.Getenv("GOOGLE_CLIENT_ID")
 	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
 
 	if refreshToken == "" || clientID == "" || clientSecret == "" {
-		return nil, fmt.Errorf("missing google oauth env vars (DATAFACT_GOOGLE_REFRESH_TOKEN, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)")
+		return nil, fmt.Errorf("missing google oauth env vars")
 	}
 
-	// Konfigurasi OAuth2
 	config := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Endpoint:     google.Endpoint, // Endpoint Google standar
+		Endpoint:     google.Endpoint,
 		Scopes:       []string{sheets.SpreadsheetsScope},
 	}
 
-	// Buat struct Token awal hanya dengan Refresh Token
-	// Library akan otomatis menukarnya dengan Access Token baru
 	token := &oauth2.Token{
 		RefreshToken: refreshToken,
 		TokenType:    "Bearer",
 	}
 
-	// Buat HTTP Client yang otomatis me-refresh token
 	client := config.Client(ctx, token)
-
-	// Return service dengan client tersebut
 	return sheets.NewService(ctx, option.WithHTTPClient(client))
 }
 
-// --- Helper: Call Gemini REST API ---
-
 func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) {
+	// [Kode callGemini sama seperti sebelumnya, tidak ada perubahan logika]
+    // ... Implementasi sama ...
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
 
 	payload := GeminiPayload{
@@ -316,7 +310,6 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 	req, _ := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
 	req.Header.Set("Content-Type", "application/json")
 
-	// Menggunakan fastClient dari utils.go (shared client)
 	resp, err := fastClient.Do(req)
 	if err != nil {
 		return "", err
@@ -339,8 +332,6 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 	return "", fmt.Errorf("no content generated")
 }
-
-// --- Helper: Clean Markdown JSON ---
 
 func cleanMarkdownJSON(raw string) string {
 	raw = strings.TrimSpace(raw)
