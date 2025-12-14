@@ -30,16 +30,16 @@ type FormSaveState struct {
 }
 
 type ScrapeResponse struct {
-	Description string        `json:"description"`
+	Description string         `json:"description"`
 	Questions   []QuestionItem `json:"questions"`
-	Saves       FormSaveState `json:"saves"`
+	Saves       FormSaveState  `json:"saves"`
 }
 
 // --- Logic ---
 
 func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
-	// User Agent dimiripkan dengan browser asli agar Google tidak memblokir
+	// User Agent penting agar tidak dianggap bot oleh Google
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	// Menggunakan fastClient dari utils.go
@@ -52,43 +52,53 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	content := string(bodyBytes)
 
-	// --- PERBAIKAN REGEX DISINI ---
-	// 1. Regex cari variable FB_PUBLIC_LOAD_DATA_
-	// Menggunakan [\s\S]*? agar bisa menangkap multi-line JSON (masalah utama pada HTML yang Anda kirim)
-	// Menggunakan \s*=\s* agar toleran terhadap spasi sebelum/sesudah sama dengan
-	re := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);`)
+	// --- PERBAIKAN UTAMA DISINI ---
+	// Masalah sebelumnya: JSON terpotong karena ada karakter ';' di dalam teks deskripsi/pertanyaan.
+	// Solusi: Kita mencari pattern sampai ketemu '; </script>', yang menandakan akhir blok data yang valid.
+	// [\s\S]*? = ambil semua karakter (termasuk enter)
+	// ;\s*</script> = berhenti HANYA jika ketemu titik koma yang diikuti tag penutup script.
+	re := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);\s*</script>`)
 	match := re.FindStringSubmatch(content)
+	
+	// Fallback logic: Jika struktur HTML berubah dan tidak ada </script> langsung,
+	// coba regex greedy yang lebih agresif mencari array bracket terakhir.
 	if len(match) < 2 {
-		return nil, fmt.Errorf("gagal menemukan data form (FB_PUBLIC_LOAD_DATA_) - format mungkin berubah atau terproteksi")
+		reFallback := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*(\[[\s\S]*\]);`)
+		match = reFallback.FindStringSubmatch(content)
+	}
+
+	if len(match) < 2 {
+		return nil, fmt.Errorf("gagal menemukan data form (FB_PUBLIC_LOAD_DATA_)")
 	}
 
 	jsonStr := match[1]
 
 	var rawData []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &rawData); err != nil {
+		// Log error ini biasanya muncul jika jsonStr terpotong
 		return nil, fmt.Errorf("gagal parsing JSON form structure: %v", err)
 	}
 
 	// 2. Cari Token FBZX
-	// Update regex agar lebih fleksibel menangkap attribute value (bisa pakai ' atau " atau spasi)
 	var fbzx string
+	// Regex fbzx diperluas sedikit untuk menghandle variasi kutip
 	reFbzx := regexp.MustCompile(`name=["']fbzx["']\s+value=["'](.*?)["']`)
 	fbzxMatch := reFbzx.FindStringSubmatch(content)
 	if len(fbzxMatch) > 1 {
 		fbzx = fbzxMatch[1]
 	} else {
-		// Fallback: Ambil dari rawData index ke-14 jika regex input hidden gagal
+		// Tetap gunakan fallback logic lama yang terbukti ampuh
 		if len(rawData) > 14 {
 			if val, ok := rawData[14].(string); ok {
 				fbzx = val
 			} else if valFloat, ok := rawData[14].(float64); ok {
-				// Kadang fbzx berupa angka murni di JSON, konversi ke string
 				fbzx = strconv.FormatFloat(valFloat, 'f', -1, 64)
 			}
 		}
 	}
 
-	// 3. Parsing Pertanyaan (LOGIC TIDAK DIUBAH)
+	// 3. Parsing Pertanyaan
+	// LOGIC SAMA PERSIS SEPERTI KODE LAMA (STRICT PADA SAVES)
 	if len(rawData) < 2 {
 		return nil, fmt.Errorf("struktur JSON invalid")
 	}
@@ -112,7 +122,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 			continue
 		}
 
-		// Logic pengambilan ID ini dipertahankan
 		inputDetails, ok := qArray[4].([]interface{})
 		if !ok || len(inputDetails) == 0 {
 			continue
@@ -154,6 +163,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	desc, _ := lvl1[0].(string)
 
+	// LOGIC SAVES DIPERTAHANKAN SESUAI PERMINTAAN
 	return &ScrapeResponse{
 		Description: desc,
 		Questions:   questions,
@@ -193,6 +203,7 @@ func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
 
 	data, err := scrapeGoogleForm(req.FormURL)
 	if err != nil {
+		// Menambahkan log detail error ke response agar mudah debug jika terjadi lagi
 		http.Error(w, "scraping failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
