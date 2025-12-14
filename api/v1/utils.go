@@ -12,11 +12,24 @@ import (
 )
 
 // =====================
-// 1. Shared HTTP Client
+// 1. Shared Models
 // =====================
 
-// fastClient dideklarasikan di level package agar bisa dipakai oleh
-// persona-filter.go, form-scrapper.go, dan form-injector.go
+// FormSaveState dipindahkan ke sini agar bisa dipakai oleh scrapper dan injector
+// tanpa error "redeclared".
+type FormSaveState struct {
+	FormID        string           `json:"form_id"`
+	Fbzx          string           `json:"fbzx"`
+	PageHistory   string           `json:"page_history"`
+	EntryIDs      []int64          `json:"entry_ids"`
+	// Field Baru: Menyimpan peta "Pertanyaan" -> "ID"
+	EntryMappings map[string]int64 `json:"entry_mappings"` 
+}
+
+// =====================
+// 2. Shared HTTP Client
+// =====================
+
 var fastClient = newFastHTTPClient()
 
 func newFastHTTPClient() *http.Client {
@@ -37,7 +50,7 @@ func newFastHTTPClient() *http.Client {
 }
 
 // =====================
-// 2. Authentication
+// 3. Authentication
 // =====================
 
 func mustAuthorize(r *http.Request) error {
@@ -63,7 +76,6 @@ func mustAuthorize(r *http.Request) error {
 
 	return nil
 }
-
 // =====================
 // 3. Env Helpers
 // =====================

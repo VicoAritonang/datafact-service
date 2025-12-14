@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort" // Tambahan import untuk sorting
 	"strconv"
 	"strings"
 	"sync"
@@ -15,11 +14,12 @@ import (
 
 // --- Models Injector ---
 
-// Kita gunakan json.RawMessage untuk menangani input yang dinamis (bisa string, bisa object)
+// FormSaveState dihapus dari sini, menggunakan yang ada di utils.go
+
 type InjectRequest struct {
 	FormURL string          `json:"form_url"`
-	Saves   json.RawMessage `json:"saves"`   // Raw: bisa string JSON atau objek JSON
-	Answers json.RawMessage `json:"answers"` // Raw: bisa string JSON atau array JSON
+	Saves   json.RawMessage `json:"saves"`
+	Answers json.RawMessage `json:"answers"`
 }
 
 type InjectResult struct {
@@ -31,7 +31,6 @@ type InjectResult struct {
 
 // --- Helper Functions ---
 
-// helper untuk menangani "Double JSON Encoding" dari n8n
 func parseFlexibleJSON(raw json.RawMessage, target interface{}) error {
 	var jsonString string
 	if err := json.Unmarshal(raw, &jsonString); err == nil {
@@ -53,14 +52,14 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Decode Level 1 (Wrapper)
+	// 1. Decode Wrapper
 	var req InjectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// 2. Parsing Flexible 'Saves'
+	// 2. Parsing Flexible 'Saves' (Menggunakan struct dari utils.go)
 	var savesData FormSaveState
 	if len(req.Saves) > 0 {
 		if err := parseFlexibleJSON(req.Saves, &savesData); err != nil {
@@ -78,54 +77,52 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Normalisasi Jawaban (FIXED: Deterministic Ordering)
-	var finalAnswers [][]interface{}
+	// 4. Normalisasi Jawaban (FIX: Menggunakan Mapping, bukan Sorting)
+	// Kita ubah struktur penyimpanan menjadi Map [ID] -> [Jawaban]
+	var finalAnswers []map[int64]interface{}
 
 	for _, item := range rawAnswers {
+		rowMap := make(map[int64]interface{})
+
 		switch v := item.(type) {
 		case []interface{}:
-			// Format Array: [ "Budi", 20 ] -> Urutan sesuai index (Aman)
-			finalAnswers = append(finalAnswers, v)
-
-		case map[string]interface{}:
-			// Format Object: { "Nama": "Budi", "Usia": 20 }
-			// PERBAIKAN: Menghindari random iteration map di Go.
-
-			// Langkah A: Cek apakah key-nya adalah Entry ID?
-			// Ini fitur advanced: user bisa kirim {"12345": "Jawaban"} agar pasti tepat sasaran
-			rowByID := make([]interface{}, len(savesData.EntryIDs))
-			matchByID := false
-
-			for idx, id := range savesData.EntryIDs {
-				idStr := strconv.FormatInt(id, 10)
-				// Cek apakah ada key yang sama dengan ID Entry
-				if val, ok := v[idStr]; ok {
-					rowByID[idx] = val
-					matchByID = true
-				} else {
-					// Jika pakai mode ID tapi data kosong, isi nil
-					rowByID[idx] = nil 
+			// Format Array: [ "Budi", 20 ] -> Masih mengandalkan urutan index entry_ids (Legacy mode)
+			for i, val := range v {
+				if i < len(savesData.EntryIDs) {
+					rowMap[savesData.EntryIDs[i]] = val
 				}
 			}
+			finalAnswers = append(finalAnswers, rowMap)
 
-			if matchByID {
-				// Jika ditemukan setidaknya satu key yang cocok dengan ID, gunakan mode ini
-				finalAnswers = append(finalAnswers, rowByID)
-			} else {
-				// Langkah B: Jika key bukan ID (misal "Nama", "Email")
-				// Kita HARUS mengurutkan key secara alfabetis agar stabil (Deterministik)
-				// User disarankan memberi prefix di n8n: "1_Nama", "2_Email" agar urut
-				var keys []string
-				for k := range v {
-					keys = append(keys, k)
+		case map[string]interface{}:
+			// Format Object: { "Nama": "Budi", "Email": "..." }
+			// KITA GUNAKAN MAPPING DARI SCRAPPER
+			
+			for key, val := range v {
+				// 1. Cek apakah key adalah Nama Pertanyaan (via EntryMappings)
+				if id, found := savesData.EntryMappings[key]; found {
+					rowMap[id] = val
+					continue
 				}
-				sort.Strings(keys) // SORTING DILAKUKAN DISINI
 
-				var row []interface{}
-				for _, k := range keys {
-					row = append(row, v[k])
+				// 2. Fallback: Cek jika key itu sendiri adalah ID (user kirim ID manual)
+				if idParsed, err := strconv.ParseInt(key, 10, 64); err == nil {
+					// Pastikan ID ini valid ada di form
+					isValid := false
+					for _, eid := range savesData.EntryIDs {
+						if eid == idParsed {
+							isValid = true
+							break
+						}
+					}
+					if isValid {
+						rowMap[idParsed] = val
+					}
 				}
-				finalAnswers = append(finalAnswers, row)
+			}
+			
+			if len(rowMap) > 0 {
+				finalAnswers = append(finalAnswers, rowMap)
 			}
 
 		default:
@@ -135,15 +132,11 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Validasi Data
 	if len(finalAnswers) == 0 {
-		http.Error(w, "no answers provided/parsed", http.StatusBadRequest)
-		return
-	}
-	if len(savesData.EntryIDs) == 0 {
-		http.Error(w, "invalid saves data: entry_ids missing", http.StatusBadRequest)
+		http.Error(w, "no answers provided/parsed or mapping failed", http.StatusBadRequest)
 		return
 	}
 
-	// 5. Proses Concurrent Injection (TIDAK BERUBAH)
+	// 5. Proses Concurrent Injection
 	var wg sync.WaitGroup
 	total := len(finalAnswers)
 	resultChan := make(chan string, total)
@@ -155,10 +148,10 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 	maxConcurrency := 20
 	semaphore := make(chan struct{}, maxConcurrency)
 
-	for i, ansRow := range finalAnswers {
+	for i, ansRowMap := range finalAnswers {
 		wg.Add(1)
 
-		go func(idx int, answerSet []interface{}) {
+		go func(idx int, answerMap map[int64]interface{}) {
 			defer wg.Done()
 
 			semaphore <- struct{}{}
@@ -166,20 +159,14 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 			var responses []interface{}
 
-			// Mapping jawaban ke Entry ID
-			for j, val := range answerSet {
-				if j >= len(savesData.EntryIDs) {
-					break
-				}
-				
-				// Skip jika jawaban nil (untuk partial update via map ID)
+			// Build payload dari Map ID -> Jawaban
+			for entryID, val := range answerMap {
 				if val == nil {
 					continue
 				}
-
-				entryID := savesData.EntryIDs[j]
 				valStr := fmt.Sprintf("%v", val)
 
+				// Struktur Google Form Entry
 				entryData := []interface{}{
 					nil,
 					entryID,
@@ -231,7 +218,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 				resp.Body.Close()
 			}
 
-		}(i, ansRow)
+		}(i, ansRowMap)
 	}
 
 	wg.Wait()

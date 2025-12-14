@@ -22,27 +22,20 @@ type QuestionItem struct {
 	Options []string `json:"options,omitempty"`
 }
 
-type FormSaveState struct {
-	FormID      string  `json:"form_id"`
-	Fbzx        string  `json:"fbzx"`
-	PageHistory string  `json:"page_history"`
-	EntryIDs    []int64 `json:"entry_ids"`
-}
+// FormSaveState dihapus dari sini karena sudah ada di utils.go
 
 type ScrapeResponse struct {
-	Description string         `json:"description"`
+	Description string        `json:"description"`
 	Questions   []QuestionItem `json:"questions"`
-	Saves       FormSaveState  `json:"saves"`
+	Saves       FormSaveState `json:"saves"` // Menggunakan struct dari utils.go
 }
 
 // --- Logic ---
 
 func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
-	// User Agent penting agar tidak dianggap bot oleh Google
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	// Menggunakan fastClient dari utils.go
 	resp, err := fastClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -52,16 +45,9 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	content := string(bodyBytes)
 
-	// --- PERBAIKAN UTAMA DISINI ---
-	// Masalah sebelumnya: JSON terpotong karena ada karakter ';' di dalam teks deskripsi/pertanyaan.
-	// Solusi: Kita mencari pattern sampai ketemu '; </script>', yang menandakan akhir blok data yang valid.
-	// [\s\S]*? = ambil semua karakter (termasuk enter)
-	// ;\s*</script> = berhenti HANYA jika ketemu titik koma yang diikuti tag penutup script.
 	re := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);\s*</script>`)
 	match := re.FindStringSubmatch(content)
-	
-	// Fallback logic: Jika struktur HTML berubah dan tidak ada </script> langsung,
-	// coba regex greedy yang lebih agresif mencari array bracket terakhir.
+
 	if len(match) < 2 {
 		reFallback := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*(\[[\s\S]*\]);`)
 		match = reFallback.FindStringSubmatch(content)
@@ -75,19 +61,16 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	var rawData []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &rawData); err != nil {
-		// Log error ini biasanya muncul jika jsonStr terpotong
 		return nil, fmt.Errorf("gagal parsing JSON form structure: %v", err)
 	}
 
 	// 2. Cari Token FBZX
 	var fbzx string
-	// Regex fbzx diperluas sedikit untuk menghandle variasi kutip
 	reFbzx := regexp.MustCompile(`name=["']fbzx["']\s+value=["'](.*?)["']`)
 	fbzxMatch := reFbzx.FindStringSubmatch(content)
 	if len(fbzxMatch) > 1 {
 		fbzx = fbzxMatch[1]
 	} else {
-		// Tetap gunakan fallback logic lama yang terbukti ampuh
 		if len(rawData) > 14 {
 			if val, ok := rawData[14].(string); ok {
 				fbzx = val
@@ -98,7 +81,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	}
 
 	// 3. Parsing Pertanyaan
-	// LOGIC SAMA PERSIS SEPERTI KODE LAMA (STRICT PADA SAVES)
 	if len(rawData) < 2 {
 		return nil, fmt.Errorf("struktur JSON invalid")
 	}
@@ -115,6 +97,9 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	var questions []QuestionItem
 	var entryIDs []int64
+	
+	// Init Map baru
+	entryMappings := make(map[string]int64)
 
 	for _, item := range rawQuestions {
 		qArray, ok := item.([]interface{})
@@ -159,32 +144,35 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 			Options: options,
 		})
 		entryIDs = append(entryIDs, entryID)
+
+		// Simpan Mapping: Text -> ID
+		if qText != "" {
+			entryMappings[qText] = entryID
+		}
 	}
 
 	desc, _ := lvl1[0].(string)
 
-	// LOGIC SAVES DIPERTAHANKAN SESUAI PERMINTAAN
 	return &ScrapeResponse{
 		Description: desc,
 		Questions:   questions,
 		Saves: FormSaveState{
-			FormID:      "scraped_" + strconv.FormatInt(time.Now().Unix(), 10),
-			Fbzx:        fbzx,
-			PageHistory: "0,1,2,3,4",
-			EntryIDs:    entryIDs,
+			FormID:        "scraped_" + strconv.FormatInt(time.Now().Unix(), 10),
+			Fbzx:          fbzx,
+			PageHistory:   "0,1,2,3,4",
+			EntryIDs:      entryIDs,
+			EntryMappings: entryMappings, // Map disertakan
 		},
 	}, nil
 }
 
 // Handler Entry Point
 func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
-	// Menggunakan mustAuthorize dari utils.go
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	// Google Cloud Run memblokir GET request yang memiliki Body JSON
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
@@ -203,7 +191,6 @@ func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
 
 	data, err := scrapeGoogleForm(req.FormURL)
 	if err != nil {
-		// Menambahkan log detail error ke response agar mudah debug jika terjadi lagi
 		http.Error(w, "scraping failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
