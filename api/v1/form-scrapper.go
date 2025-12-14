@@ -39,6 +39,7 @@ type ScrapeResponse struct {
 
 func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
+	// User Agent dimiripkan dengan browser asli agar Google tidak memblokir
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	// Menggunakan fastClient dari utils.go
@@ -51,60 +52,81 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	content := string(bodyBytes)
 
+	// --- PERBAIKAN REGEX DISINI ---
 	// 1. Regex cari variable FB_PUBLIC_LOAD_DATA_
-	re := regexp.MustCompile(`var FB_PUBLIC_LOAD_DATA_ = (.*?);`)
+	// Menggunakan [\s\S]*? agar bisa menangkap multi-line JSON (masalah utama pada HTML yang Anda kirim)
+	// Menggunakan \s*=\s* agar toleran terhadap spasi sebelum/sesudah sama dengan
+	re := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);`)
 	match := re.FindStringSubmatch(content)
 	if len(match) < 2 {
-		return nil, fmt.Errorf("gagal menemukan data form (FB_PUBLIC_LOAD_DATA_)")
+		return nil, fmt.Errorf("gagal menemukan data form (FB_PUBLIC_LOAD_DATA_) - format mungkin berubah atau terproteksi")
 	}
 
 	jsonStr := match[1]
-	
+
 	var rawData []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &rawData); err != nil {
-		return nil, fmt.Errorf("gagal parsing JSON form structure")
+		return nil, fmt.Errorf("gagal parsing JSON form structure: %v", err)
 	}
 
 	// 2. Cari Token FBZX
+	// Update regex agar lebih fleksibel menangkap attribute value (bisa pakai ' atau " atau spasi)
 	var fbzx string
-	reFbzx := regexp.MustCompile(`name="fbzx" value="(.*?)"`)
+	reFbzx := regexp.MustCompile(`name=["']fbzx["']\s+value=["'](.*?)["']`)
 	fbzxMatch := reFbzx.FindStringSubmatch(content)
 	if len(fbzxMatch) > 1 {
 		fbzx = fbzxMatch[1]
 	} else {
+		// Fallback: Ambil dari rawData index ke-14 jika regex input hidden gagal
 		if len(rawData) > 14 {
 			if val, ok := rawData[14].(string); ok {
 				fbzx = val
+			} else if valFloat, ok := rawData[14].(float64); ok {
+				// Kadang fbzx berupa angka murni di JSON, konversi ke string
+				fbzx = strconv.FormatFloat(valFloat, 'f', -1, 64)
 			}
 		}
 	}
 
-	// 3. Parsing Pertanyaan
-	if len(rawData) < 2 { return nil, fmt.Errorf("struktur JSON invalid") }
-	
+	// 3. Parsing Pertanyaan (LOGIC TIDAK DIUBAH)
+	if len(rawData) < 2 {
+		return nil, fmt.Errorf("struktur JSON invalid")
+	}
+
 	lvl1, ok := rawData[1].([]interface{})
-	if !ok || len(lvl1) < 2 { return nil, fmt.Errorf("gagal akses level 1") }
-	
+	if !ok || len(lvl1) < 2 {
+		return nil, fmt.Errorf("gagal akses level 1")
+	}
+
 	rawQuestions, ok := lvl1[1].([]interface{})
-	if !ok { return nil, fmt.Errorf("gagal akses list pertanyaan") }
+	if !ok {
+		return nil, fmt.Errorf("gagal akses list pertanyaan")
+	}
 
 	var questions []QuestionItem
 	var entryIDs []int64
 
 	for _, item := range rawQuestions {
 		qArray, ok := item.([]interface{})
-		if !ok || len(qArray) < 5 { continue }
+		if !ok || len(qArray) < 5 {
+			continue
+		}
 
+		// Logic pengambilan ID ini dipertahankan
 		inputDetails, ok := qArray[4].([]interface{})
 		if !ok || len(inputDetails) == 0 {
-			continue 
+			continue
 		}
 
 		detailInner, ok := inputDetails[0].([]interface{})
-		if !ok || len(detailInner) == 0 { continue }
-		
+		if !ok || len(detailInner) == 0 {
+			continue
+		}
+
 		idFloat, ok := detailInner[0].(float64)
-		if !ok { continue }
+		if !ok {
+			continue
+		}
 		entryID := int64(idFloat)
 
 		qText, _ := qArray[1].(string)
@@ -152,7 +174,6 @@ func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// UBAH DISINI: Ganti GET menjadi POST
 	// Google Cloud Run memblokir GET request yang memiliki Body JSON
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
