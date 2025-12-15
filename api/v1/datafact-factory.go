@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -256,36 +257,32 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 	jsonBody, _ := json.Marshal(payload)
 
-	// ===== RETRY LOGIC =====
 	const maxRetry = 2
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetry; attempt++ {
-		// Context timeout per request
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
 
 		req, _ := http.NewRequestWithContext(
 			ctx,
-			"POST",
+			http.MethodPost,
 			url,
 			strings.NewReader(string(jsonBody)),
 		)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := geminiClient.Do(req)
+		cancel() // ✅ PENTING: cancel LANGSUNG, bukan defer
+
 		if err != nil {
 			lastErr = err
-
-			// Exponential backoff
 			time.Sleep(time.Duration(1<<attempt) * time.Second)
 			continue
 		}
 
-		defer resp.Body.Close()
-
 		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			lastErr = fmt.Errorf("gemini api %d: %s", resp.StatusCode, body)
 			time.Sleep(time.Duration(1<<attempt) * time.Second)
 			continue
@@ -293,13 +290,16 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 		if resp.StatusCode != 200 {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			return "", fmt.Errorf("gemini api error %d: %s", resp.StatusCode, body)
 		}
 
 		var gResp GeminiResponse
 		if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
+			resp.Body.Close()
 			return "", err
 		}
+		resp.Body.Close()
 
 		if len(gResp.Candidates) > 0 &&
 			len(gResp.Candidates[0].Content.Parts) > 0 {
@@ -311,6 +311,7 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 	return "", fmt.Errorf("gemini failed after retries: %w", lastErr)
 }
+
 
 
 func cleanMarkdownJSON(raw string) string {
