@@ -146,3 +146,4 @@ func toInt64(v interface{}) (int64, error) {
 		return 0, errors.New("numerik tidak valid")
 	}
 }
+

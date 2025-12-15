@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,6 +12,28 @@ import (
 )
 
 // --- Models Factory ---
+var geminiClient = newGeminiHTTPClient()
+
+func newGeminiHTTPClient() *http.Client {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 90 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 2 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: tr,
+		Timeout:   75 * time.Second, // PENTING
+	}
+}
 
 type FactoryRequest struct {
 	SystemPromptFactory []string `json:"system_prompt_factory"`
@@ -202,7 +225,6 @@ func runFactoryThenParse(req FactoryRequest, persona string, limiter *time.Ticke
 // =====================
 // Gemini call + helpers
 // =====================
-
 func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) {
 	url := fmt.Sprintf(
 		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
@@ -234,31 +256,62 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 	jsonBody, _ := json.Marshal(payload)
 
-	httpReq, _ := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
-	httpReq.Header.Set("Content-Type", "application/json")
+	// ===== RETRY LOGIC =====
+	const maxRetry = 2
+	var lastErr error
 
-	resp, err := fastClient.Do(httpReq)
-	if err != nil {
-		return "", err
+	for attempt := 0; attempt <= maxRetry; attempt++ {
+		// Context timeout per request
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		req, _ := http.NewRequestWithContext(
+			ctx,
+			"POST",
+			url,
+			strings.NewReader(string(jsonBody)),
+		)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := geminiClient.Do(req)
+		if err != nil {
+			lastErr = err
+
+			// Exponential backoff
+			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			body, _ := io.ReadAll(resp.Body)
+			lastErr = fmt.Errorf("gemini api %d: %s", resp.StatusCode, body)
+			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("gemini api error %d: %s", resp.StatusCode, body)
+		}
+
+		var gResp GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
+			return "", err
+		}
+
+		if len(gResp.Candidates) > 0 &&
+			len(gResp.Candidates[0].Content.Parts) > 0 {
+			return gResp.Candidates[0].Content.Parts[0].Text, nil
+		}
+
+		return "", fmt.Errorf("no content generated")
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("gemini api error %d: %s", resp.StatusCode, string(body))
-	}
-
-	var gResp GeminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
-		return "", err
-	}
-
-	if len(gResp.Candidates) > 0 && len(gResp.Candidates[0].Content.Parts) > 0 {
-		return gResp.Candidates[0].Content.Parts[0].Text, nil
-	}
-
-	return "", fmt.Errorf("no content generated")
+	return "", fmt.Errorf("gemini failed after retries: %w", lastErr)
 }
+
 
 func cleanMarkdownJSON(raw string) string {
 	raw = strings.TrimSpace(raw)
