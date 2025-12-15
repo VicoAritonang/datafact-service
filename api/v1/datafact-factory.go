@@ -1,19 +1,13 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
-
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/option"
-	"google.golang.org/api/sheets/v4"
+	"time"
 )
 
 // --- Models Factory ---
@@ -21,21 +15,27 @@ import (
 type FactoryRequest struct {
 	SystemPromptFactory []string `json:"system_prompt_factory"`
 	UserPromptFactory   string   `json:"user_prompt_factory"`
-	UserPromptParser    string   `json:"user_prompt_parser"`
-	SystemPromptParser  string   `json:"system_prompt_parser"`
-	FormText            string   `json:"form_text"`
-	GeminiAPIKey        string   `json:"gemini_api_key"`
-	SpreadsheetID       string   `json:"spreadsheet_id"`
-	Model               string   `json:"model"`
+
+	// Parser stage
+	UserPromptParser   string `json:"user_prompt_parser"`
+	SystemPromptParser string `json:"system_prompt_parser"`
+
+	// Optional (masih diterima agar kompatibel dengan client lama)
+	FormText      string `json:"form_text"`
+	GeminiAPIKey  string `json:"gemini_api_key"`
+	SpreadsheetID string `json:"spreadsheet_id"` // DIABAIKAN (tidak dipakai lagi)
+	Model         string `json:"model"`
 }
 
 type FactoryResponse struct {
 	TotalProcessed int      `json:"total_processed"`
 	SuccessCount   int      `json:"success_count"`
-	Errors         []string `json:"errors"`
+	Results        []string `json:"results"` // hasil PARSER, panjang = N (index selaras persona)
+	Errors         []string `json:"errors"`  // daftar error per task
 }
 
-// Struct Gemini (Sama seperti sebelumnya)
+// Struct Gemini
+
 type GeminiContent struct {
 	Role  string `json:"role"`
 	Parts []struct {
@@ -64,235 +64,150 @@ type GeminiResponse struct {
 // --- Handler ---
 
 func DataFactFactoryHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Authorization
+	// 1) Authorization
 	if err := mustAuthorize(r); err != nil {
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
 
+	// 2) Parse request
 	var req FactoryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Validasi
-	if req.SpreadsheetID == "" || req.GeminiAPIKey == "" {
-		http.Error(w, "spreadsheet_id and gemini_api_key are required", http.StatusBadRequest)
+	// 3) Validasi minimum
+	if req.GeminiAPIKey == "" {
+		http.Error(w, "gemini_api_key is required", http.StatusBadRequest)
+		return
+	}
+	if len(req.SystemPromptFactory) == 0 {
+		http.Error(w, "system_prompt_factory must be a non-empty array", http.StatusBadRequest)
+		return
+	}
+	if req.UserPromptFactory == "" {
+		http.Error(w, "user_prompt_factory is required", http.StatusBadRequest)
+		return
+	}
+	if req.SystemPromptParser == "" {
+		http.Error(w, "system_prompt_parser is required", http.StatusBadRequest)
+		return
+	}
+	if req.UserPromptParser == "" {
+		http.Error(w, "user_prompt_parser is required", http.StatusBadRequest)
 		return
 	}
 	if req.Model == "" {
 		req.Model = "gemini-2.5-flash"
 	}
 
-	// 2. Init Google Sheets Service
-	ctx := context.Background()
-	sheetsService, err := createSheetsServiceWithRefreshToken(ctx)
-	if err != nil {
-		fmt.Printf("Sheets Auth Error: %v\n", err)
-		http.Error(w, "failed to init sheets service: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// 3. READ HEADER (Manual Map Automatically Logic)
-	// Kita baca baris pertama untuk tahu urutan kolom
-	readRange := "Sheet1!A1:ZZ1" // Baca selebar mungkin di baris 1
-	resp, err := sheetsService.Spreadsheets.Values.Get(req.SpreadsheetID, readRange).Do()
-	if err != nil {
-		http.Error(w, "failed to read header: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if len(resp.Values) == 0 {
-		http.Error(w, "Sheet1 header row is empty", http.StatusBadRequest)
-		return
-	}
-
-	headers := resp.Values[0] // Interface slice: ["Nama", "Usia", "Kota"]
-	
-	// Simpan urutan header: map["nama"] = 0, map["usia"] = 1
-	headerIndexMap := make(map[string]int)
-	for i, h := range headers {
-		if s, ok := h.(string); ok {
-			// Lowercase & trim agar matching lebih gampang
-			cleanHeader := strings.ToLower(strings.TrimSpace(s))
-			headerIndexMap[cleanHeader] = i
-		}
-	}
-	
-	// Debug Log untuk memastikan Header terbaca
-	fmt.Printf("[DEBUG] Headers Found: %v\n", headerIndexMap)
-
-	// 4. Orchestration Loop
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	maxConcurrency := 5
+	// 4) Concurrency controls
+	const maxConcurrency = 5
 	sem := make(chan struct{}, maxConcurrency)
 
-	resultDetails := []string{}
-	successCount := 0
-	totalTasks := len(req.SystemPromptFactory)
+	// “Buffer” sederhana: rate limit agar tidak burst ke Gemini (stabilin concurrency).
+	// Misal: 10 request/detik total. Silakan adjust.
+	limiter := time.NewTicker(100 * time.Millisecond) // 10 rps
+	defer limiter.Stop()
 
-	for i, personaPrompt := range req.SystemPromptFactory {
+	// Hasil final: harus berurutan sesuai index persona
+	n := len(req.SystemPromptFactory)
+	results := make([]string, n)
+
+	var (
+		wg           sync.WaitGroup
+		muErr        sync.Mutex
+		errorsList   []string
+		successCount int
+	)
+
+	for i := 0; i < n; i++ {
 		wg.Add(1)
+		personaPrompt := req.SystemPromptFactory[i]
 
 		go func(idx int, persona string) {
 			defer wg.Done()
+
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// --- A. Gemini Generate ---
-			taskUserPrompt := req.UserPromptFactory
-			if req.FormText != "" {
-				taskUserPrompt = strings.ReplaceAll(taskUserPrompt, "{{ $json.form }}", req.FormText)
-			}
-			genResult, err := callGemini(req.Model, req.GeminiAPIKey, persona, taskUserPrompt)
+			parsed, err := runFactoryThenParse(req, persona, limiter)
 			if err != nil {
-				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Gen Fail: %v", idx, err))
-				mu.Unlock()
+				muErr.Lock()
+				errorsList = append(errorsList, fmt.Sprintf("Task %d Fail: %v", idx, err))
+				muErr.Unlock()
 				return
 			}
 
-			// --- B. Gemini Parser ---
-			parserUserPrompt := req.UserPromptParser
-			n8nPlaceholder := "{{ $json.choices[0].message.content }}"
-			if strings.Contains(parserUserPrompt, n8nPlaceholder) {
-				parserUserPrompt = strings.ReplaceAll(parserUserPrompt, n8nPlaceholder, genResult)
-			} else {
-				parserUserPrompt = parserUserPrompt + "\n\nInput Text:\n" + genResult
-			}
-			
-			parsedRawStr, err := callGemini(req.Model, req.GeminiAPIKey, req.SystemPromptParser, parserUserPrompt)
-			if err != nil {
-				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Parse Fail: %v", idx, err))
-				mu.Unlock()
-				return
-			}
+			// aman: tiap goroutine menulis index unik
+			results[idx] = parsed
 
-			// --- C. JSON Parsing ---
-			cleanedJSON := cleanMarkdownJSON(parsedRawStr)
-			var dataMap map[string]interface{}
-			if err := json.Unmarshal([]byte(cleanedJSON), &dataMap); err != nil {
-				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d JSON Fail: %v (Raw: %s)", idx, err, cleanedJSON))
-				mu.Unlock()
-				return
-			}
-
-			// --- D. MAPPING (The "Map Automatically" Logic) ---
-			// Siapkan array kosong seukuran jumlah header
-			rowValues := make([]interface{}, len(headers))
-			// Isi default string kosong agar tidak null
-			for k := range rowValues {
-				rowValues[k] = ""
-			}
-
-			mappedCount := 0
-			// Loop setiap key dari JSON hasil AI
-			for jsonKey, jsonVal := range dataMap {
-				// Bersihkan key dari JSON
-				cleanKey := strings.ToLower(strings.TrimSpace(jsonKey))
-				
-				// Cek apakah key ini ada di header sheet kita?
-				if colIdx, exists := headerIndexMap[cleanKey]; exists {
-					rowValues[colIdx] = jsonVal
-					mappedCount++
-				} else {
-					// Opsional: Log jika ada key dari AI yang tidak ada kolomnya di Sheet
-					// fmt.Printf("[DEBUG] Key '%s' from AI not found in Sheet Headers\n", jsonKey)
-				}
-			}
-
-			// Jika tidak ada satupun data yang ter-mapping, kemungkinan besar format header beda
-			if mappedCount == 0 {
-				mu.Lock()
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Warning: No columns mapped! AI Keys: %v vs Headers: %v", idx, dataMap, headers))
-				mu.Unlock()
-				return // Skip write daripada nulis baris kosong
-			}
-
-			// --- E. WRITE TO SHEET ---
-			
-			// ValueRange object
-			vr := &sheets.ValueRange{
-				Values: [][]interface{}{rowValues},
-			}
-
-			// APPEND REQUEST
-			// valueInputOption: USER_ENTERED (Penting agar angka masuk sebagai angka)
-			// insertDataOption: INSERT_ROWS (Penting agar sheet tidak cuma update row kosong tapi bikin row baru)
-			// range: "Sheet1" (Nama sheet saja, biarkan Google tentukan baris paling bawah)
-			
-			// Kita lock mutex karena write sheet sebaiknya serial untuk menghindari race condition di API
-			mu.Lock() 
-			_, err = sheetsService.Spreadsheets.Values.Append(req.SpreadsheetID, "Sheet1", vr).
-				ValueInputOption("USER_ENTERED").
-				InsertDataOption("INSERT_ROWS").
-				Do()
-				
-			if err != nil {
-				resultDetails = append(resultDetails, fmt.Sprintf("Task %d Write Fail: %v", idx, err))
-			} else {
-				successCount++
-			}
-			mu.Unlock()
-
+			muErr.Lock()
+			successCount++
+			muErr.Unlock()
 		}(i, personaPrompt)
 	}
 
 	wg.Wait()
 
 	respData := FactoryResponse{
-		TotalProcessed: totalTasks,
+		TotalProcessed: n,
 		SuccessCount:   successCount,
-		Errors:         resultDetails,
+		Results:        results,
+		Errors:         errorsList,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(respData)
+	_ = json.NewEncoder(w).Encode(respData)
 }
 
-// ==========================================
-// HELPER FUNCTIONS (JANGAN LUPA DISERTAKAN)
-// ==========================================
+// =====================
+// Subroutine: 2-stage pipeline
+// =====================
 
-func createSheetsServiceWithRefreshToken(ctx context.Context) (*sheets.Service, error) {
-	refreshToken := os.Getenv("DATAFACT_GOOGLE_REFRESH_TOKEN")
-	clientID := os.Getenv("GOOGLE_CLIENT_ID")
-	clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
-
-	if refreshToken == "" || clientID == "" || clientSecret == "" {
-		return nil, fmt.Errorf("missing google oauth env vars")
+func runFactoryThenParse(req FactoryRequest, persona string, limiter *time.Ticker) (string, error) {
+	// Stage A: Factory call
+	factoryUser := req.UserPromptFactory
+	if req.FormText != "" {
+		// kompatibel dengan placeholder n8n Anda
+		factoryUser = strings.ReplaceAll(factoryUser, "{{ $json.form }}", req.FormText)
 	}
 
-	config := &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		Endpoint:     google.Endpoint,
-		Scopes:       []string{sheets.SpreadsheetsScope},
+	<-limiter.C
+	genResult, err := callGemini(req.Model, req.GeminiAPIKey, persona, factoryUser)
+	if err != nil {
+		return "", fmt.Errorf("factory gemini call failed: %w", err)
 	}
 
-	token := &oauth2.Token{
-		RefreshToken: refreshToken,
-		TokenType:    "Bearer",
+	// Stage B: Parser call
+	// Anda minta: "{{OUTPUT DARI FACTORY}} + make sure you make it only with this format ..."
+	// Jadi kita prepend output factory ke user_prompt_parser.
+	parserUser := strings.TrimSpace(genResult) + "\n\n" + strings.TrimSpace(req.UserPromptParser)
+
+	<-limiter.C
+	parsedRaw, err := callGemini(req.Model, req.GeminiAPIKey, req.SystemPromptParser, parserUser)
+	if err != nil {
+		return "", fmt.Errorf("parser gemini call failed: %w", err)
 	}
 
-	client := config.Client(ctx, token)
-	return sheets.NewService(ctx, option.WithHTTPClient(client))
+	// Output parser dikembalikan “utuh”
+	return strings.TrimSpace(parsedRaw), nil
 }
+
+// =====================
+// Gemini call + helpers
+// =====================
 
 func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) {
-	// (Kode callGemini sama seperti sebelumnya, copy paste dari jawaban sebelumnya)
-    // Pastikan pakai fastClient dari utils.go
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+	url := fmt.Sprintf(
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+		model, apiKey,
+	)
 
 	payload := GeminiPayload{
 		Contents: []GeminiContent{
@@ -318,10 +233,11 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 	}
 
 	jsonBody, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := fastClient.Do(req)
+	httpReq, _ := http.NewRequest("POST", url, strings.NewReader(string(jsonBody)))
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := fastClient.Do(httpReq)
 	if err != nil {
 		return "", err
 	}
