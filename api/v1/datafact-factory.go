@@ -202,7 +202,7 @@ func runFactoryThenParse(req FactoryRequest, persona string, limiter *time.Ticke
 		factoryUser = strings.ReplaceAll(factoryUser, "{{ $json.form }}", req.FormText)
 	}
 
-	<-limiter.C
+	
 	genResult, err := callGemini(req.Model, req.GeminiAPIKey, persona, factoryUser)
 	if err != nil {
 		return "", fmt.Errorf("factory gemini call failed: %w", err)
@@ -213,7 +213,7 @@ func runFactoryThenParse(req FactoryRequest, persona string, limiter *time.Ticke
 	// Jadi kita prepend output factory ke user_prompt_parser.
 	parserUser := strings.TrimSpace(genResult) + "\n\n" + strings.TrimSpace(req.UserPromptParser)
 
-	<-limiter.C
+	
 	parsedRaw, err := callGemini(req.Model, req.GeminiAPIKey, req.SystemPromptParser, parserUser)
 	if err != nil {
 		return "", fmt.Errorf("parser gemini call failed: %w", err)
@@ -257,11 +257,13 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 
 	jsonBody, _ := json.Marshal(payload)
 
-	const maxRetry = 2
+	const maxRetry = 4 // ⬅️ NAIKKAN
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetry; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+
+		// 🔐 context hidup FULL selama request + read body
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 
 		req, _ := http.NewRequestWithContext(
 			ctx,
@@ -272,41 +274,48 @@ func callGemini(model, apiKey, systemPrompt, userPrompt string) (string, error) 
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := geminiClient.Do(req)
-		cancel() // ✅ PENTING: cancel LANGSUNG, bukan defer
-
 		if err != nil {
+			cancel()
 			lastErr = err
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			continue
+		}
+
+		// ⬇️ BODY DIBACA DULU
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel() // ✅ CANCEL SETELAH BODY SELESAI
+
+		if readErr != nil {
+			lastErr = readErr
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 			continue
 		}
 
 		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("gemini api %d: %s", resp.StatusCode, body)
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			lastErr = fmt.Errorf("gemini api %d: %s", resp.StatusCode, bodyBytes)
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Second)
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return "", fmt.Errorf("gemini api error %d: %s", resp.StatusCode, body)
+			return "", fmt.Errorf("gemini api error %d: %s", resp.StatusCode, bodyBytes)
 		}
 
 		var gResp GeminiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&gResp); err != nil {
-			resp.Body.Close()
-			return "", err
+		if err := json.Unmarshal(bodyBytes, &gResp); err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			continue
 		}
-		resp.Body.Close()
 
 		if len(gResp.Candidates) > 0 &&
 			len(gResp.Candidates[0].Content.Parts) > 0 {
 			return gResp.Candidates[0].Content.Parts[0].Text, nil
 		}
 
-		return "", fmt.Errorf("no content generated")
+		lastErr = fmt.Errorf("empty response")
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 	}
 
 	return "", fmt.Errorf("gemini failed after retries: %w", lastErr)
