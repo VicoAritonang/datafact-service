@@ -14,8 +14,6 @@ import (
 
 // --- Models Injector ---
 
-// FormSaveState dihapus dari sini, menggunakan yang ada di utils.go
-
 type InjectRequest struct {
 	FormURL string          `json:"form_url"`
 	Saves   json.RawMessage `json:"saves"`
@@ -59,7 +57,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Parsing Flexible 'Saves' (Menggunakan struct dari utils.go)
+	// 2. Parsing Flexible 'Saves'
 	var savesData FormSaveState
 	if len(req.Saves) > 0 {
 		if err := parseFlexibleJSON(req.Saves, &savesData); err != nil {
@@ -77,37 +75,49 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Normalisasi Jawaban (FIX: Menggunakan Mapping, bukan Sorting)
-	// Kita ubah struktur penyimpanan menjadi Map [ID] -> [Jawaban]
-	var finalAnswers []map[int64]interface{}
+	// 4. Normalisasi Jawaban (Map [ID] -> [Jawaban]) + Support Email
+	// Kita buat struktur struct sementara untuk menampung data baris
+	type RowData struct {
+		AnswersMap map[int64]interface{}
+		Email      string
+	}
+	
+	var finalRows []RowData
 
 	for _, item := range rawAnswers {
 		rowMap := make(map[int64]interface{})
+		var emailAddr string
 
 		switch v := item.(type) {
 		case []interface{}:
-			// Format Array: [ "Budi", 20 ] -> Masih mengandalkan urutan index entry_ids (Legacy mode)
+			// Legacy Array Mode
 			for i, val := range v {
 				if i < len(savesData.EntryIDs) {
 					rowMap[savesData.EntryIDs[i]] = val
 				}
 			}
-			finalAnswers = append(finalAnswers, rowMap)
+			finalRows = append(finalRows, RowData{AnswersMap: rowMap})
 
 		case map[string]interface{}:
-			// Format Object: { "Nama": "Budi", "Email": "..." }
-			// KITA GUNAKAN MAPPING DARI SCRAPPER
-			
+			// Object Mode
 			for key, val := range v {
-				// 1. Cek apakah key adalah Nama Pertanyaan (via EntryMappings)
+				// Cek Khusus Email
+				if strings.ToLower(key) == "email" || strings.ToLower(key) == "email address" {
+					if eStr, ok := val.(string); ok {
+						emailAddr = eStr
+					}
+					continue
+				}
+
+				// 1. Cek Mapping Nama Pertanyaan -> ID
 				if id, found := savesData.EntryMappings[key]; found {
 					rowMap[id] = val
 					continue
 				}
 
-				// 2. Fallback: Cek jika key itu sendiri adalah ID (user kirim ID manual)
+				// 2. Cek ID Manual
 				if idParsed, err := strconv.ParseInt(key, 10, 64); err == nil {
-					// Pastikan ID ini valid ada di form
+					// Validasi keberadaan ID
 					isValid := false
 					for _, eid := range savesData.EntryIDs {
 						if eid == idParsed {
@@ -121,8 +131,8 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			
-			if len(rowMap) > 0 {
-				finalAnswers = append(finalAnswers, rowMap)
+			if len(rowMap) > 0 || emailAddr != "" {
+				finalRows = append(finalRows, RowData{AnswersMap: rowMap, Email: emailAddr})
 			}
 
 		default:
@@ -130,28 +140,27 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Validasi Data
-	if len(finalAnswers) == 0 {
-		http.Error(w, "no answers provided/parsed or mapping failed", http.StatusBadRequest)
+	if len(finalRows) == 0 {
+		http.Error(w, "no answers provided/parsed", http.StatusBadRequest)
 		return
 	}
 
 	// 5. Proses Concurrent Injection
 	var wg sync.WaitGroup
-	total := len(finalAnswers)
+	total := len(finalRows)
 	resultChan := make(chan string, total)
 
 	successCount := 0
 	failCount := 0
 	var mu sync.Mutex
 
-	maxConcurrency := 20
+	maxConcurrency := 10 // Jangan terlalu agresif ke Google
 	semaphore := make(chan struct{}, maxConcurrency)
 
-	for i, ansRowMap := range finalAnswers {
+	for i, row := range finalRows {
 		wg.Add(1)
 
-		go func(idx int, answerMap map[int64]interface{}) {
+		go func(idx int, rData RowData) {
 			defer wg.Done()
 
 			semaphore <- struct{}{}
@@ -159,26 +168,53 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 
 			var responses []interface{}
 
-			// Build payload dari Map ID -> Jawaban
-			for entryID, val := range answerMap {
+			// Build payload
+			for entryID, val := range rData.AnswersMap {
 				if val == nil {
 					continue
 				}
-				valStr := fmt.Sprintf("%v", val)
 
-				// Struktur Google Form Entry
+				// FIX: Handling Slice/Array untuk Checkbox
+				var finalVal []string
+
+				switch rawVal := val.(type) {
+				case []interface{}:
+					// Jika input JSON adalah array: ["A", "B"]
+					for _, subVal := range rawVal {
+						finalVal = append(finalVal, fmt.Sprintf("%v", subVal))
+					}
+				case []string:
+					finalVal = rawVal
+				default:
+					// Single value
+					finalVal = []string{fmt.Sprintf("%v", val)}
+				}
+                
+                // Jika kosong, skip
+                if len(finalVal) == 0 {
+                    continue
+                }
+
+				// Struktur Entry Google Form: [nil, ID, [Values...], 0]
 				entryData := []interface{}{
 					nil,
 					entryID,
-					[]string{valStr},
+					finalVal, // Harus array of string
 					0,
 				}
 				responses = append(responses, entryData)
 			}
+            
+            // Handle Email (jika ada form yang mewajibkan collect email)
+            var emailField interface{} = nil
+            if rData.Email != "" {
+                emailField = rData.Email
+            }
 
+			// Struktur Utama Payload
 			fullStructure := []interface{}{
 				responses,
-				nil,
+				emailField, // Index 1: Email Address (jika di-enable di form)
 				savesData.Fbzx,
 			}
 
@@ -187,27 +223,39 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 			data := url.Values{}
 			data.Set("fvv", "1")
 			data.Set("partialResponse", string(partialJSON))
-			data.Set("pageHistory", savesData.PageHistory)
+			data.Set("pageHistory", savesData.PageHistory) // Menggunakan hasil dinamis dari scrapper
 			data.Set("fbzx", savesData.Fbzx)
 			data.Set("submissionTimestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 
 			postReq, _ := http.NewRequest("POST", req.FormURL, strings.NewReader(data.Encode()))
 			postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			postReq.Header.Set("User-Agent", "Mozilla/5.0 (DataFact Injector Bot)")
+			
+			// Tambahkan Referer/Origin agar lebih dipercaya
 			postReq.Header.Set("Origin", "https://docs.google.com")
+			postReq.Header.Set("Referer", req.FormURL)
 
 			resp, err := fastClient.Do(postReq)
 
 			mu.Lock()
 			if err == nil && resp.StatusCode == 200 {
 				successCount++
+                // Optional: Debug success
+                // resultChan <- fmt.Sprintf("Row %d success", idx)
 			} else {
 				failCount++
 				errMsg := "unknown error"
 				if err != nil {
 					errMsg = err.Error()
 				} else {
-					errMsg = fmt.Sprintf("HTTP Status %d", resp.StatusCode)
+                    // Baca body error google untuk detail
+                    bodyErr, _ := io.ReadAll(resp.Body)
+                    // Ambil potongan body untuk log (kadang HTML panjang)
+                    snippet := string(bodyErr)
+                    if len(snippet) > 200 {
+                        snippet = snippet[:200]
+                    }
+					errMsg = fmt.Sprintf("HTTP %d | Body: %s", resp.StatusCode, snippet)
 				}
 				resultChan <- fmt.Sprintf("Row %d failed: %s", idx, errMsg)
 			}
@@ -218,7 +266,7 @@ func InjectorHandler(w http.ResponseWriter, r *http.Request) {
 				resp.Body.Close()
 			}
 
-		}(i, ansRowMap)
+		}(i, row)
 	}
 
 	wg.Wait()
