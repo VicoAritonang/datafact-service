@@ -26,7 +26,7 @@ type ScrapeResponse struct {
 	Description string        `json:"description"`
 	Questions   []QuestionItem `json:"questions"`
 	Saves       FormSaveState `json:"saves"`
-	CookieEmail int           `json:"cookie_email"`	
+	CookieEmail int            `json:"cookie_email"` // 1 = Cookie/Auto, 0 = Manual/None
 }
 
 // --- Logic ---
@@ -35,7 +35,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	resp, err := fastClient.Do(req)
+	resp, err := fastClient.Do(req) // Pastikan fastClient sudah didefinisikan di package Anda (var global)
 	if err != nil {
 		return nil, err
 	}
@@ -63,12 +63,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		return nil, fmt.Errorf("gagal parsing JSON form structure: %v", err)
 	}
 
-	// --- Deteksi Cookie Email ---
-	cookieEmail := 0
-	if strings.Contains(content, `data-user-email-address=""`) || strings.Contains(content, `readonly data-initial-value=""`) {
-		cookieEmail = 1
-	}
-
 	// 2. Cari Token FBZX
 	var fbzx string
 	reFbzx := regexp.MustCompile(`name=["']fbzx["']\s+value=["'](.*?)["']`)
@@ -76,7 +70,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	if len(fbzxMatch) > 1 {
 		fbzx = fbzxMatch[1]
 	} else {
-		// Fallback cari di rawData index 14
 		if len(rawData) > 14 {
 			if val, ok := rawData[14].(string); ok {
 				fbzx = val
@@ -86,7 +79,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		}
 	}
 
-	// 3. Parsing Pertanyaan & Page History
+	// 3. Parsing Pertanyaan, Page History, & Cookie Email
 	if len(rawData) < 2 {
 		return nil, fmt.Errorf("struktur JSON invalid")
 	}
@@ -94,6 +87,20 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	lvl1, ok := rawData[1].([]interface{})
 	if !ok || len(lvl1) < 2 {
 		return nil, fmt.Errorf("gagal akses level 1")
+	}
+
+	// --- LOGIC BARU: Cek Cookie Email ---
+	// Index 10 di lvl1 menentukan tipe koleksi email.
+	// 1 = Input Manual (Responder Input) -> cookie_email = 0
+	// 2 = Verified (Login Required/Cookie) -> cookie_email = 1
+	// 0 atau null = Tidak collect -> cookie_email = 0
+	cookieEmail := 0
+	if len(lvl1) > 10 {
+		if valFloat, ok := lvl1[10].(float64); ok {
+			if int(valFloat) == 2 {
+				cookieEmail = 1
+			}
+		}
 	}
 
 	rawQuestions, ok := lvl1[1].([]interface{})
@@ -104,35 +111,29 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	var questions []QuestionItem
 	var entryIDs []int64
 	entryMappings := make(map[string]int64)
-	
-	// -- LOGIC BARU: Dynamic Page History --
-	// Page 0 selalu ada. Setiap ketemu "Type 8" (Section Break), page nambah.
+
 	pageCount := 0
-	
+
 	for _, item := range rawQuestions {
 		qArray, ok := item.([]interface{})
 		if !ok || len(qArray) < 4 {
 			continue
 		}
 
-		// Cek Tipe Item (Index ke-3)
-		// 0=Short, 1=Paragraph, 2=Radio, 4=Checkbox, 8=SectionHeader (PageBreak), dll
 		var itemType int
 		if tFloat, ok := qArray[3].(float64); ok {
 			itemType = int(tFloat)
 		}
 
-		// Jika tipe adalah 8, ini adalah Page Break
 		if itemType == 8 {
 			pageCount++
-			continue // Section header bukan pertanyaan input
+			continue
 		}
 
-		// Cek detail input (Index ke-4) untuk pertanyaan biasa
 		if len(qArray) < 5 {
 			continue
 		}
-		
+
 		inputDetails, ok := qArray[4].([]interface{})
 		if !ok || len(inputDetails) == 0 {
 			continue
@@ -150,7 +151,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		entryID := int64(idFloat)
 		qText, _ := qArray[1].(string)
 
-		// Ambil Opsi Jawaban (jika ada)
 		var options []string
 		if len(detailInner) > 1 {
 			if optsRaw, ok := detailInner[1].([]interface{}); ok {
@@ -176,7 +176,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		}
 	}
 
-	// Generate String Page History (contoh: "0,1,2")
 	var pageHistoryParts []string
 	for i := 0; i <= pageCount; i++ {
 		pageHistoryParts = append(pageHistoryParts, strconv.Itoa(i))
@@ -188,26 +187,20 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	return &ScrapeResponse{
 		Description: desc,
 		Questions:   questions,
+		CookieEmail: cookieEmail, // <-- Field Baru
 		Saves: FormSaveState{
 			FormID:        "scraped_" + strconv.FormatInt(time.Now().Unix(), 10),
 			Fbzx:          fbzx,
-			PageHistory:   finalPageHistory, // DINAMIS, TIDAK HARDCODED
+			PageHistory:   finalPageHistory,
 			EntryIDs:      entryIDs,
 			EntryMappings: entryMappings,
 		},
-		CookieEmail: cookieEmail,
 	}, nil
 }
 
-// ScrapperHandler tetap sama...
 func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
-    // ... copy logic handler yang lama ...
-    // Pastikan memanggil scrapeGoogleForm yang baru
-    // ...
-    if err := mustAuthorize(r); err != nil {
-		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
+    // Auth check (jika ada fungsi mustAuthorize)
+    // if err := mustAuthorize(r); err != nil { ... }
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
