@@ -26,6 +26,7 @@ type ScrapeResponse struct {
 	Description string        `json:"description"`
 	Questions   []QuestionItem `json:"questions"`
 	Saves       FormSaveState `json:"saves"`
+	CookieEmail int           `json:"cookie_email"`	
 }
 
 // --- Logic ---
@@ -60,6 +61,12 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	var rawData []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &rawData); err != nil {
 		return nil, fmt.Errorf("gagal parsing JSON form structure: %v", err)
+	}
+
+	// --- Deteksi Cookie Email ---
+	cookieEmail := 0
+	if strings.Contains(content, `data-user-email-address=""`) || strings.Contains(content, `readonly data-initial-value=""`) {
+		cookieEmail = 1
 	}
 
 	// 2. Cari Token FBZX
@@ -188,6 +195,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 			EntryIDs:      entryIDs,
 			EntryMappings: entryMappings,
 		},
+		CookieEmail: cookieEmail,
 	}, nil
 }
 
