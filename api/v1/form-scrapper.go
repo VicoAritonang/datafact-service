@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// --- Models Scrapper (Tetap sama) ---
+// --- Models Scrapper ---
 type ScrapeRequest struct {
 	FormURL string `json:"form_url"`
 }
@@ -25,8 +25,8 @@ type QuestionItem struct {
 type ScrapeResponse struct {
 	Description string        `json:"description"`
 	Questions   []QuestionItem `json:"questions"`
+	CookieEmail int           `json:"cookie_email"` // 0, 1, atau 2 sesuai logika HTML
 	Saves       FormSaveState `json:"saves"`
-	CookieEmail int            `json:"cookie_email"` // 1 = Cookie/Auto, 0 = Manual/None
 }
 
 // --- Logic ---
@@ -35,7 +35,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	req, _ := http.NewRequest("GET", formURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	resp, err := fastClient.Do(req) // Pastikan fastClient sudah didefinisikan di package Anda (var global)
+	resp, err := fastClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -43,6 +43,21 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	content := string(bodyBytes)
+
+	// --- LOGIC BARU: Cek Raw HTML String ---
+	// Kita lakukan pengecekan string mentah sebelum parsing JSON yang berat.
+	// Prioritas: Cek login (2) dulu, baru cek autocomplete (1).
+	
+	cookieEmail := 0
+
+	if strings.Contains(content, `data-sign-in-to-continue="true"`) {
+		// Logika: User wajib login / Verified Email (Cookie)
+		cookieEmail = 2
+	} else if strings.Contains(content, `autocomplete="email"`) {
+		// Logika: Ada input field email manual
+		cookieEmail = 1
+	}
+	// Jika tidak keduanya, tetap 0
 
 	// 1. Ekstrak FB_PUBLIC_LOAD_DATA_
 	re := regexp.MustCompile(`var\s+FB_PUBLIC_LOAD_DATA_\s*=\s*([\s\S]*?);\s*</script>`)
@@ -79,7 +94,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		}
 	}
 
-	// 3. Parsing Pertanyaan, Page History, & Cookie Email
+	// 3. Parsing Pertanyaan & Page History
 	if len(rawData) < 2 {
 		return nil, fmt.Errorf("struktur JSON invalid")
 	}
@@ -87,20 +102,6 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	lvl1, ok := rawData[1].([]interface{})
 	if !ok || len(lvl1) < 2 {
 		return nil, fmt.Errorf("gagal akses level 1")
-	}
-
-	// --- LOGIC BARU: Cek Cookie Email ---
-	// Index 10 di lvl1 menentukan tipe koleksi email.
-	// 1 = Input Manual (Responder Input) -> cookie_email = 0
-	// 2 = Verified (Login Required/Cookie) -> cookie_email = 1
-	// 0 atau null = Tidak collect -> cookie_email = 0
-	cookieEmail := 0
-	if len(lvl1) > 10 {
-		if valFloat, ok := lvl1[10].(float64); ok {
-			if int(valFloat) == 2 {
-				cookieEmail = 1
-			}
-		}
 	}
 
 	rawQuestions, ok := lvl1[1].([]interface{})
@@ -113,13 +114,14 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	entryMappings := make(map[string]int64)
 
 	pageCount := 0
-
+	
 	for _, item := range rawQuestions {
 		qArray, ok := item.([]interface{})
 		if !ok || len(qArray) < 4 {
 			continue
 		}
 
+		// Cek Tipe Item
 		var itemType int
 		if tFloat, ok := qArray[3].(float64); ok {
 			itemType = int(tFloat)
@@ -133,7 +135,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 		if len(qArray) < 5 {
 			continue
 		}
-
+		
 		inputDetails, ok := qArray[4].([]interface{})
 		if !ok || len(inputDetails) == 0 {
 			continue
@@ -187,7 +189,7 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	return &ScrapeResponse{
 		Description: desc,
 		Questions:   questions,
-		CookieEmail: cookieEmail, // <-- Field Baru
+		CookieEmail: cookieEmail, // Menggunakan hasil cek HTML di atas
 		Saves: FormSaveState{
 			FormID:        "scraped_" + strconv.FormatInt(time.Now().Unix(), 10),
 			Fbzx:          fbzx,
@@ -198,11 +200,11 @@ func scrapeGoogleForm(formURL string) (*ScrapeResponse, error) {
 	}, nil
 }
 
+// Handler tetap sama
 func ScrapperHandler(w http.ResponseWriter, r *http.Request) {
-    // Auth check (jika ada fungsi mustAuthorize)
-    // if err := mustAuthorize(r); err != nil { ... }
-
-	if r.Method != http.MethodPost {
+    // ... (kode handler sama seperti sebelumnya) ...
+    // Pastikan memanggil scrapeGoogleForm yang baru ini
+    if r.Method != http.MethodPost {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
